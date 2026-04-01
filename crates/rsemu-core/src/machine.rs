@@ -494,18 +494,21 @@ impl<C: CpuCore> Machine<C> {
         core_hz: u64,
         tim_clk_hz: u64,
     ) {
-        let timer = self.timers[index].clone();
-        if !self.timer_clock_enabled(&timer.peripheral) {
+        // Copy lightweight fields to avoid borrowing self through the clone
+        let regs = self.timers[index].regs;
+        let irq = self.timers[index].irq;
+
+        if !self.timer_clock_enabled(&self.timers[index].peripheral) {
             return;
         }
-        let cr1 = read_mmio_u32(&self.mmio, timer.regs.cr1);
+        let cr1 = read_mmio_u32(&self.mmio, regs.cr1);
         if (cr1 & 0x1) == 0 {
             return;
         }
 
-        let psc = read_mmio_u32(&self.mmio, timer.regs.psc) as u64;
-        let arr = read_mmio_u32(&self.mmio, timer.regs.arr) as u64;
-        let mut cnt = read_mmio_u32(&self.mmio, timer.regs.cnt) as u64;
+        let psc = read_mmio_u32(&self.mmio, regs.psc) as u64;
+        let arr = read_mmio_u32(&self.mmio, regs.arr) as u64;
+        let cnt = read_mmio_u32(&self.mmio, regs.cnt) as u64;
 
         let counter_hz = (tim_clk_hz / (psc + 1)).max(1);
         let numer = self.timers[index]
@@ -520,22 +523,22 @@ impl<C: CpuCore> Machine<C> {
         let period = arr.saturating_add(1).max(1);
         let total = cnt.saturating_add(ticks);
         let wraps = total / period;
-        cnt = total % period;
-        write_mmio_u32(&mut self.mmio, timer.regs.cnt, cnt as u32);
+        let new_cnt = total % period;
+        write_mmio_u32(&mut self.mmio, regs.cnt, new_cnt as u32);
 
         if wraps == 0 {
             return;
         }
 
-        let sr = read_mmio_u32(&self.mmio, timer.regs.sr) | 0x1;
-        write_mmio_u32(&mut self.mmio, timer.regs.sr, sr);
-        if let Some(event) = decode_mmio_write(&self.register_meta, timer.regs.sr, 4, sr) {
+        let sr = read_mmio_u32(&self.mmio, regs.sr) | 0x1;
+        write_mmio_u32(&mut self.mmio, regs.sr, sr);
+        if let Some(event) = decode_mmio_write(&self.register_meta, regs.sr, 4, sr) {
             self.mmio_writes.push(event);
         }
 
-        let dier = read_mmio_u32(&self.mmio, timer.regs.dier);
+        let dier = read_mmio_u32(&self.mmio, regs.dier);
         if (dier & 0x1) != 0 {
-            if let Some(irq) = timer.irq {
+            if let Some(irq) = irq {
                 nvic_pending_write(&mut self.mmio, irq, true);
             }
         }
@@ -663,14 +666,20 @@ struct MachineBus<'a> {
 }
 
 impl SystemBus for MachineBus<'_> {
+    #[inline]
     fn read8(&mut self, addr: u64) -> Result<u8, String> {
-        if let Some(value) = self
-            .memory
-            .iter()
-            .find_map(|block| block.read8(addr))
-            .or_else(|| flash_alias_read(self.memory, self.flash_base, self.flash_alias_base, addr))
-        {
-            return Ok(value);
+        // Fast path: memory blocks (flash/RAM live below 0x4000_0000)
+        if addr < 0x4000_0000 {
+            for block in self.memory.iter() {
+                if let Some(value) = block.read8(addr) {
+                    return Ok(value);
+                }
+            }
+            if let Some(value) =
+                flash_alias_read(self.memory, self.flash_base, self.flash_alias_base, addr)
+            {
+                return Ok(value);
+            }
         }
 
         if let Some(meta) = self.register_meta.get(&addr) {
@@ -688,7 +697,8 @@ impl SystemBus for MachineBus<'_> {
                 let sr = spi_sr_sanitized(self.mmio, meta.paired_addr);
                 let byte = ((sr >> ((meta.byte_offset as u32) * 8)) & 0xFF) as u8;
                 if meta.byte_offset == 0
-                    && ((byte & (1 << 5)) != 0 || std::env::var_os("RSEMU_TRACE_SPI_SR").is_some())
+                    && ((byte & (1 << 5)) != 0
+                        || std::env::var_os("RSEMU_TRACE_SPI_SR").is_some())
                 {
                     eprintln!(
                         "trace.spi.sr pc=0x{:08x} addr=0x{addr:08x} value=0x{byte:02x}",
@@ -711,17 +721,33 @@ impl SystemBus for MachineBus<'_> {
             .ok_or_else(|| format!("read from unmapped address 0x{addr:08x}"))
     }
 
-    fn write8(&mut self, addr: u64, value: u8) -> Result<(), String> {
-        if (0x2000_4f80..=0x2000_4f9f).contains(&addr) {
-            if std::env::var_os("RSEMU_WATCH_RAM").is_some() {
-                eprintln!(
-                    "watch.ram.write8 pc=0x{:08x} addr=0x{addr:08x} value=0x{value:02x}",
-                    self.current_pc
-                );
+    #[inline]
+    fn read16(&mut self, addr: u64) -> Result<u16, String> {
+        // Fast path: native 16-bit read from memory blocks
+        if addr < 0x4000_0000 {
+            for block in self.memory.iter() {
+                if let Some(value) = block.read16(addr) {
+                    return Ok(value);
+                }
+            }
+            if let Some(value) =
+                flash_alias_read16(self.memory, self.flash_base, self.flash_alias_base, addr)
+            {
+                return Ok(value);
             }
         }
-        if let Some(block) = self.memory.iter_mut().find(|block| block.contains(addr)) {
-            return block.write8(addr, value);
+        // Fallback to 2x read8 for MMIO
+        let lo = self.read8(addr)? as u16;
+        let hi = self.read8(addr + 1)? as u16;
+        Ok(lo | (hi << 8))
+    }
+
+    fn write8(&mut self, addr: u64, value: u8) -> Result<(), String> {
+        // Fast path: memory blocks
+        if addr < 0x4000_0000 {
+            if let Some(block) = self.memory.iter_mut().find(|block| block.contains(addr)) {
+                return block.write8(addr, value);
+            }
         }
 
         if write_special_mmio(
@@ -765,46 +791,33 @@ impl SystemBus for MachineBus<'_> {
         }
     }
 
+    #[inline]
+    fn write16(&mut self, addr: u64, value: u16) -> Result<(), String> {
+        // Fast path: native 16-bit write to memory blocks
+        if addr < 0x4000_0000 {
+            if let Some(block) = self.memory.iter_mut().find(|block| block.contains(addr)) {
+                return block.write16(addr, value);
+            }
+        }
+        // Fallback to 2x write8 for MMIO
+        self.write8(addr, (value & 0xFF) as u8)?;
+        self.write8(addr + 1, (value >> 8) as u8)
+    }
+
+    #[inline]
     fn read32(&mut self, addr: u64) -> Result<u32, String> {
-        if let Some(value) = self
-            .memory
-            .iter()
-            .find_map(|block| {
-                if block.contains(addr) && block.contains(addr + 3) {
-                    let b0 = block.read8(addr)? as u32;
-                    let b1 = block.read8(addr + 1)? as u32;
-                    let b2 = block.read8(addr + 2)? as u32;
-                    let b3 = block.read8(addr + 3)? as u32;
-                    Some(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
-                } else {
-                    None
+        // Fast path: native 32-bit read from memory blocks
+        if addr < 0x4000_0000 {
+            for block in self.memory.iter() {
+                if let Some(value) = block.read32(addr) {
+                    return Ok(value);
                 }
-            })
-            .or_else(|| {
-                let b0 =
-                    flash_alias_read(self.memory, self.flash_base, self.flash_alias_base, addr)?;
-                let b1 = flash_alias_read(
-                    self.memory,
-                    self.flash_base,
-                    self.flash_alias_base,
-                    addr + 1,
-                )?;
-                let b2 = flash_alias_read(
-                    self.memory,
-                    self.flash_base,
-                    self.flash_alias_base,
-                    addr + 2,
-                )?;
-                let b3 = flash_alias_read(
-                    self.memory,
-                    self.flash_base,
-                    self.flash_alias_base,
-                    addr + 3,
-                )?;
-                Some((b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16) | ((b3 as u32) << 24))
-            })
-        {
-            return Ok(value);
+            }
+            if let Some(value) =
+                flash_alias_read32(self.memory, self.flash_base, self.flash_alias_base, addr)
+            {
+                return Ok(value);
+            }
         }
 
         if let Some(meta) = self.register_meta.get(&addr) {
@@ -841,14 +854,13 @@ impl SystemBus for MachineBus<'_> {
     }
 
     fn write32(&mut self, addr: u64, value: u32) -> Result<(), String> {
-        if (0x2000_4f80..=0x2000_4f9f).contains(&addr) {
-            if std::env::var_os("RSEMU_WATCH_RAM").is_some() {
-                eprintln!(
-                    "watch.ram.write32 pc=0x{:08x} addr=0x{addr:08x} value=0x{value:08x}",
-                    self.current_pc
-                );
+        // Fast path: native 32-bit write to memory blocks
+        if addr < 0x4000_0000 {
+            if let Some(block) = self.memory.iter_mut().find(|block| block.contains(addr)) {
+                return block.write32(addr, value);
             }
         }
+
         if write_special_mmio_u32(
             self.mmio,
             self.serial_output,
@@ -876,12 +888,9 @@ impl SystemBus for MachineBus<'_> {
             return Ok(());
         }
 
+        // Memory fallback for aliased addresses
         if let Some(block) = self.memory.iter_mut().find(|block| block.contains(addr)) {
-            let bytes = value.to_le_bytes();
-            for (index, byte) in bytes.iter().enumerate() {
-                block.write8(addr + index as u64, *byte)?;
-            }
-            return Ok(());
+            return block.write32(addr, value);
         }
 
         if is_peripheral_addr(addr) {
@@ -915,6 +924,44 @@ fn flash_alias_read(
             && addr < flash_alias_base + block.len() as u64
         {
             block.read8(flash_base + (addr - flash_alias_base))
+        } else {
+            None
+        }
+    })
+}
+
+fn flash_alias_read16(
+    blocks: &[MemoryBlock],
+    flash_base: u64,
+    flash_alias_base: Option<u64>,
+    addr: u64,
+) -> Option<u16> {
+    let flash_alias_base = flash_alias_base?;
+    blocks.iter().find_map(|block| {
+        if !block.writable()
+            && addr >= flash_alias_base
+            && addr + 1 < flash_alias_base + block.len() as u64
+        {
+            block.read16(flash_base + (addr - flash_alias_base))
+        } else {
+            None
+        }
+    })
+}
+
+fn flash_alias_read32(
+    blocks: &[MemoryBlock],
+    flash_base: u64,
+    flash_alias_base: Option<u64>,
+    addr: u64,
+) -> Option<u32> {
+    let flash_alias_base = flash_alias_base?;
+    blocks.iter().find_map(|block| {
+        if !block.writable()
+            && addr >= flash_alias_base
+            && addr + 3 < flash_alias_base + block.len() as u64
+        {
+            block.read32(flash_base + (addr - flash_alias_base))
         } else {
             None
         }
