@@ -1,0 +1,35 @@
+<device>
+  <name>STM32F103-MINI</name>
+  <peripherals>
+    <peripheral>
+      <name>GPIOA</name>
+      <baseAddress>0x40010800</baseAddress>
+      <registers>
+        <register>
+          <name>CRL</name>
+          <addressOffset>0x0</addressOffset>
+          <size>32</size>
+          <resetValue>0x44</resetValue>
+        </register>
+        <register>
+          <name>ODR</name>
+          <addressOffset>0xC</addressOffset>
+          <size>32</size>
+          <resetValue>0x0</resetValue>
+        </register>
+      </registers>
+    </peripheral>
+    <peripheral>
+      <name>USART1</name>
+      <baseAddress>0x40013800</baseAddress>
+      <registers>
+        <register>
+          <name>SR</name>
+          <addressOffset>0x0</addressOffset>
+          <size>32</size>
+          <resetValue>0xC0</resetValue>
+        </register>
+      </registers>
+    </peripheral>
+  </peripherals>
+</device>

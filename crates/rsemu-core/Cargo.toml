@@ -1,0 +1,12 @@
+[package]
+name = "rsemu-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+cpu-external-unicorn = ["dep:unicorn-engine"]
+
+[dependencies]
+unicorn-engine = { version = "2.1.5", optional = true }

@@ -1,0 +1,27 @@
+# Rust
+/target/
+**/*.rs.bk
+target/
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project specific
+/stm32f4xx-hal/target/
+/stm32f1xx-hal/target/
+*.bin
+*.elf
+!stm32-emulator/**/*.bin
+!stm32f4xx-hal/examples/*.bin
+!stm32f1xx-hal/examples/*.bin
+
+# Logs
+*.log

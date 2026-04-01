@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/rsemu-core",
+    "crates/rsemu-svd",
+    "crates/rsemu-targets",
+    "apps/rsemu-cli",
+]
+exclude = ["stm32f1xx-hal", "stm32-emulator", "stm32f4xx-hal"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+

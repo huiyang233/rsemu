@@ -1,0 +1,9 @@
+[package]
+name = "rsemu-svd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rsemu-core = { path = "../rsemu-core" }
+
