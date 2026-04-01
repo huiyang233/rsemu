@@ -15,13 +15,11 @@ target/
 *.swo
 
 # Project specific
-/stm32f4xx-hal/target/
-/stm32f1xx-hal/target/
-*.bin
-*.elf
-!stm32-emulator/**/*.bin
-!stm32f4xx-hal/examples/*.bin
-!stm32f1xx-hal/examples/*.bin
+/stm32-emulator/
+/stm32f1xx-hal/
+/stm32f4xx-hal/
+/*.bin
+/*.elf
 
 # Logs
 *.log
