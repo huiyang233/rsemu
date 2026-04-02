@@ -23,3 +23,15 @@ target/
 
 # Logs
 *.log
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Tauri/Vite build
+apps/rsemu-gui/src-tauri/target/
+apps/rsemu-gui/dist/
+
