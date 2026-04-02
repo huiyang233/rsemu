@@ -14,7 +14,7 @@ pub fn load_target(svd_xml: Option<&str>) -> Result<TargetSpec, String> {
         memory_map: vec![
             MemoryRegion {
                 name: "flash".to_string(),
-                range: 0x0800_0000..0x0808_0000,
+                range: 0x0800_0000..0x0810_0000,
                 kind: MemoryRegionKind::Flash,
             },
             MemoryRegion {

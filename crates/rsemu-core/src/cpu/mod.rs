@@ -1,4 +1,5 @@
 pub mod armv7m;
+pub mod armv7em;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArchitectureId {
@@ -24,7 +25,7 @@ pub trait CpuArchitecture {
 }
 
 pub trait CpuCore {
-    fn step(&mut self, bus: &mut dyn crate::bus::SystemBus) -> Result<(), String>;
+    fn step(&mut self, bus: &mut dyn crate::bus::SystemBus, max_steps: usize) -> Result<u32, String>;
     fn reset(
         &mut self,
         bus: &mut dyn crate::bus::SystemBus,

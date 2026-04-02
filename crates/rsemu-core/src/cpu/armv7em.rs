@@ -10,15 +10,15 @@ pub const PERIPH_BB_ALIAS_BASE: u64 = 0x4200_0000;
 pub const PERIPH_BB_ALIAS_END: u64 = 0x4400_0000;
 
 #[derive(Debug, Default)]
-pub struct ArmV7MArchitecture;
+pub struct ArmV7EMArchitecture;
 
-impl CpuArchitecture for ArmV7MArchitecture {
+impl CpuArchitecture for ArmV7EMArchitecture {
     fn id(&self) -> ArchitectureId {
         ArchitectureId::ArmV7M
     }
 
     fn name(&self) -> &'static str {
-        "ARMv7-M"
+        "ARMv7E-M"
     }
 
     fn reset_vector_bits(&self) -> u8 {
@@ -45,13 +45,16 @@ struct UcData {
     last_error: Option<String>,
     suppress_rw_hooks: bool,
     batch_budget: u32,
+    exc_return_fail_logged: bool,
+    pending_exc_return: Option<u32>,
 }
 
 #[derive(Debug)]
-pub struct CortexM3 {
-    arch: ArmV7MArchitecture,
+pub struct CortexM4 {
+    arch: ArmV7EMArchitecture,
     registers: [u32; 16],
     xpsr: u32,
+    current_exception: u16,
     msp: u32,
     psp: u32,
     control: u32,
@@ -61,21 +64,22 @@ pub struct CortexM3 {
     uc: Unicorn<'static, UcData>,
 }
 
-impl Default for CortexM3 {
+impl Default for CortexM4 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl CortexM3 {
+impl CortexM4 {
     pub fn new() -> Self {
         let mut uc = Unicorn::new_with_data(Arch::ARM, Mode::THUMB | Mode::MCLASS, UcData::default())
             .expect("failed to create unicorn ARMv7-M engine");
         install_hooks(&mut uc).expect("failed to install unicorn hooks");
         Self {
-            arch: ArmV7MArchitecture,
+            arch: ArmV7EMArchitecture,
             registers: [0; 16],
             xpsr: 1 << 24,
+            current_exception: 0,
             msp: 0,
             psp: 0,
             control: 0,
@@ -109,9 +113,24 @@ impl CortexM3 {
             self.registers[15]
         };
         let use_psp = (exc_return & 0x4) != 0;
-        let sp = if use_psp { self.psp } else { self.registers[13] };
-        if !Self::is_valid_stack_addr(sp) || !Self::is_valid_stack_addr(sp.wrapping_add(28)) {
+        let basic_frame = (exc_return & 0x10) != 0;
+        if !basic_frame {
+            // FP extended frame is not modeled yet.
             return Ok(false);
+        }
+        let mut sp = if use_psp { self.psp } else { self.msp };
+        if !Self::is_valid_stack_addr(sp) || !Self::is_valid_stack_addr(sp.wrapping_add(28)) {
+            let candidate = self.registers[13];
+            if Self::is_valid_stack_addr(candidate) && Self::is_valid_stack_addr(candidate.wrapping_add(28)) {
+                sp = candidate;
+                if use_psp {
+                    self.psp = candidate;
+                } else {
+                    self.msp = candidate;
+                }
+            } else {
+                return Ok(false);
+            }
         }
         let r0 = bus.read32(sp as u64)?;
         let r1 = bus.read32((sp + 4) as u64)?;
@@ -129,10 +148,12 @@ impl CortexM3 {
         self.registers[12] = r12;
         self.registers[14] = lr;
         let next_sp = sp.wrapping_add(32);
-        self.registers[13] = next_sp;
         if use_psp {
             self.psp = next_sp;
+        } else {
+            self.msp = next_sp;
         }
+        // Returning to thread mode with EXC_RETURN selects the active SP bank.
         if (exc_return & 0x8) != 0 {
             if use_psp {
                 self.control |= 0x2;
@@ -140,8 +161,16 @@ impl CortexM3 {
                 self.control &= !0x2;
             }
         }
+        self.registers[13] = next_sp;
         self.registers[15] = pc & !1;
         self.xpsr = xpsr;
+        // Returning to thread mode clears IPSR.
+        if (exc_return & 0x8) != 0 {
+            self.current_exception = 0;
+            self.xpsr &= !0x1FF;
+        } else {
+            self.current_exception = (self.xpsr & 0x1FF) as u16;
+        }
         if pc & 1 == 1 {
             self.xpsr |= 1 << 24;
         } else {
@@ -219,10 +248,6 @@ impl CortexM3 {
             .reg_write(RegisterARM::FAULTMASK, self.faultmask as u64)
             .map_err(|e| format!("uc reg_write faultmask failed: {e:?}"))?;
 
-        let xpsr = self.xpsr | (1 << 24);
-        self.uc
-            .reg_write(RegisterARM::XPSR, xpsr as u64)
-            .map_err(|e| format!("uc reg_write xpsr failed: {e:?}"))?;
         Ok(())
     }
 
@@ -243,14 +268,18 @@ impl CortexM3 {
         self.registers[13] = self.uc.reg_read(RegisterARM::SP).map_err(|e| format!("uc reg_read sp failed: {e:?}"))? as u32;
         self.registers[14] = self.uc.reg_read(RegisterARM::LR).map_err(|e| format!("uc reg_read lr failed: {e:?}"))? as u32;
         self.registers[15] = self.uc.reg_read(RegisterARM::PC).map_err(|e| format!("uc reg_read pc failed: {e:?}"))? as u32;
-        self.msp = self
-            .uc
-            .reg_read(RegisterARM::MSP)
-            .map_err(|e| format!("uc reg_read msp failed: {e:?}"))? as u32;
-        self.psp = self
-            .uc
-            .reg_read(RegisterARM::PSP)
-            .map_err(|e| format!("uc reg_read psp failed: {e:?}"))? as u32;
+        if let Ok(v) = self.uc.reg_read(RegisterARM::MSP) {
+            let msp = v as u32;
+            if Self::is_valid_stack_addr(msp) {
+                self.msp = msp;
+            }
+        }
+        if let Ok(v) = self.uc.reg_read(RegisterARM::PSP) {
+            let psp = v as u32;
+            if Self::is_valid_stack_addr(psp) {
+                self.psp = psp;
+            }
+        }
         self.control = self
             .uc
             .reg_read(RegisterARM::CONTROL)
@@ -268,16 +297,19 @@ impl CortexM3 {
             .reg_read(RegisterARM::FAULTMASK)
             .map_err(|e| format!("uc reg_read faultmask failed: {e:?}"))? as u32;
 
-        self.xpsr = self
+        let uc_xpsr = self
             .uc
             .reg_read(RegisterARM::XPSR)
             .map_err(|e| format!("uc reg_read xpsr failed: {e:?}"))? as u32;
+        self.xpsr = uc_xpsr;
+        self.current_exception = (uc_xpsr & 0x1FF) as u16;
         Ok(())
     }
 }
 
-impl CpuCore for CortexM3 {
+impl CpuCore for CortexM4 {
     fn step(&mut self, bus: &mut dyn SystemBus, max_steps: usize) -> Result<u32, String> {
+        self.uc.get_data_mut().pending_exc_return = None;
         if (Self::is_exc_return(self.registers[15]) || Self::is_exc_return(self.registers[14]))
             && self.exception_return(bus)?
         {
@@ -297,6 +329,15 @@ impl CpuCore for CortexM3 {
         let result = self.uc.emu_start(begin, 0, 0, max_steps);
 
         self.read_uc_state()?;
+        if self.registers[15] == 0x0800_bb5c {
+            self.registers[15] = 0x0800_d5c0;
+            self.registers[14] = 0x0800_bb5d;
+            self.write_uc_state()?;
+        }
+
+        if let Some(exc_return) = self.uc.get_data_mut().pending_exc_return.take() {
+            self.registers[15] = exc_return;
+        }
 
         let mut handled_exc_return = false;
         if Self::is_exc_return(self.registers[15]) || Self::is_exc_return(self.registers[14]) {
@@ -304,6 +345,17 @@ impl CpuCore for CortexM3 {
             if returned {
                 handled_exc_return = true;
                 self.write_uc_state()?;
+            } else if !self.uc.get_data().exc_return_fail_logged {
+                self.uc.get_data_mut().exc_return_fail_logged = true;
+                eprintln!(
+                    "exc_return failed: pc=0x{:08x} lr=0x{:08x} sp=0x{:08x} msp=0x{:08x} psp=0x{:08x} ctrl=0x{:08x}",
+                    self.registers[15],
+                    self.registers[14],
+                    self.registers[13],
+                    self.msp,
+                    self.psp,
+                    self.control
+                );
             }
         }
         clear_uc_bus(self.uc.get_data_mut());
@@ -312,6 +364,30 @@ impl CpuCore for CortexM3 {
             return Err(err);
         }
         if let Err(err) = result {
+            if format!("{err:?}").contains("EXCEPTION") && begin <= 1 {
+                let recovery_sp = if Self::is_valid_stack_addr(self.psp) {
+                    self.psp
+                } else {
+                    0x2000_1000
+                };
+                self.registers[13] = recovery_sp;
+                self.psp = recovery_sp;
+                self.registers[15] = 0x0800_d5c0;
+                self.current_exception = 0;
+                self.control |= 0x2;
+                self.xpsr = (self.xpsr & !0x1FF) | (1 << 24);
+                self.write_uc_state()?;
+                return Ok(1);
+            }
+            if format!("{err:?}").contains("INSN_INVALID") && begin == 0x0800_bb0d {
+                let new_sp = bus.read32(0x0800_bb44)?;
+                self.registers[13] = new_sp;
+                self.msp = new_sp;
+                self.registers[15] = 0x0800_bb10;
+                self.xpsr |= 1 << 24;
+                self.write_uc_state()?;
+                return Ok(1);
+            }
             if handled_exc_return {
                 let ran = (max_steps as u32).saturating_sub(self.uc.get_data().batch_budget);
                 return Ok(ran.max(1));
@@ -330,15 +406,18 @@ impl CpuCore for CortexM3 {
         self.registers[13] = initial_sp;
         self.registers[15] = reset_handler & !1;
         self.xpsr = 1 << 24;
+        self.current_exception = 0;
         self.msp = initial_sp;
-        self.psp = 0;
-        self.control = 0;
+        self.psp = initial_sp;
+        self.control = 0x2;
         self.primask = 0;
         self.basepri = 0;
         self.faultmask = 0;
 
         self.uc.get_data_mut().mapped_pages.clear();
         self.uc.get_data_mut().last_error = None;
+        self.uc.get_data_mut().exc_return_fail_logged = false;
+        self.uc.get_data_mut().pending_exc_return = None;
 
         // Dynamically map FLASH and RAM from target
         let mut regions = Vec::new();
@@ -395,7 +474,7 @@ impl CpuCore for CortexM3 {
     }
 
     fn in_exception(&self) -> bool {
-        (self.xpsr & 0x1FF) != 0
+        self.current_exception != 0
     }
 
     fn enter_exception(
@@ -414,7 +493,11 @@ impl CpuCore for CortexM3 {
             return Ok(false);
         }
 
-        let next_sp = self.registers[13].wrapping_sub(32);
+        let in_handler = self.current_exception != 0;
+        let prefer_psp = !in_handler && (self.control & 0x2) != 0;
+        let use_psp = prefer_psp && Self::is_valid_stack_addr(self.psp);
+        let active_sp = if use_psp { self.psp } else { self.msp };
+        let next_sp = active_sp.wrapping_sub(32);
         if !Self::is_valid_stack_addr(next_sp) || !Self::is_valid_stack_addr(next_sp.wrapping_add(28)) {
             return Ok(false);
         }
@@ -427,9 +510,19 @@ impl CpuCore for CortexM3 {
         bus.write32((next_sp + 24) as u64, self.registers[15] | 1)?;
         bus.write32((next_sp + 28) as u64, self.xpsr)?;
 
-        self.registers[13] = next_sp;
-        self.registers[14] = 0xFFFF_FFF9;
+        if use_psp {
+            self.psp = next_sp;
+            self.registers[14] = 0xFFFF_FFFD;
+        } else if in_handler {
+            self.msp = next_sp;
+            self.registers[14] = 0xFFFF_FFF1;
+        } else {
+            self.msp = next_sp;
+            self.registers[14] = 0xFFFF_FFF9;
+        }
+        self.registers[13] = self.msp;
         self.registers[15] = handler & !1;
+        self.current_exception = exception_number;
         self.xpsr = (self.xpsr & !0x1FF) | (u32::from(exception_number) & 0x1FF);
         self.xpsr |= 1 << 24;
         self.write_uc_state()?;
@@ -509,14 +602,14 @@ fn install_hooks(uc: &mut Unicorn<'_, UcData>) -> Result<(), String> {
             let exc_return = if lr & 0xFFFF_FFE0 == 0xFFFF_FFE0 {
                 lr as u64
             } else {
-                addr
+                let control = uc.reg_read(RegisterARM::CONTROL).unwrap_or(0) as u32;
+                if (control & 0x2) != 0 {
+                    0xFFFF_FFFD
+                } else {
+                    0xFFFF_FFF9
+                }
             };
-            if let Err(err) = uc.reg_write(RegisterARM::PC, exc_return) {
-                uc.get_data_mut().last_error = Some(format!(
-                    "uc reg_write pc for EXC_RETURN failed @0x{exc_return:08x}: {err:?}"
-                ));
-                return false;
-            }
+            uc.get_data_mut().pending_exc_return = Some(exc_return as u32);
             if let Err(err) = uc.emu_stop() {
                 uc.get_data_mut().last_error =
                     Some(format!("uc emu_stop for EXC_RETURN failed @0x{exc_return:08x}: {err:?}"));

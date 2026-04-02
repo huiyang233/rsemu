@@ -56,8 +56,20 @@ impl MemoryBlock {
         self.data.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     pub fn writable(&self) -> bool {
         self.writable
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        &mut self.data
     }
 
     pub fn contains(&self, addr: u64) -> bool {

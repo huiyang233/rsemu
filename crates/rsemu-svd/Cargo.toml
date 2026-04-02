@@ -5,5 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-rsemu-core = { path = "../rsemu-core" }
-
+rsemu-core.workspace = true
+tracing.workspace = true
+log.workspace = true

@@ -3,7 +3,24 @@ use rsemu_svd::parse_svd;
 
 pub fn load_target(svd_xml: Option<&str>) -> Result<TargetSpec, String> {
     let xml = svd_xml.ok_or_else(|| "missing SVD: pass --svd path/to/stm32f407.svd".to_string())?;
-    let peripherals = parse_svd(xml)?.peripherals;
+    let mut peripherals = parse_svd(xml)?.peripherals;
+
+    // Patch RCC reset values to have RDY bits set
+    for p in peripherals.iter_mut() {
+        if p.name == "RCC" {
+            for r in p.registers.iter_mut() {
+                if r.name == "CR" {
+                    r.reset_value |= 0x02020002; // HSIRDY, HSERDY, PLLRDY
+                }
+                if r.name == "CSR" {
+                    r.reset_value |= 0x00000002; // LSIRDY
+                }
+                if r.name == "BDCR" {
+                    r.reset_value |= 0x00000002; // LSERDY
+                }
+            }
+        }
+    }
 
     Ok(TargetSpec {
         name: "STM32F407".to_string(),
