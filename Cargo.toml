@@ -4,6 +4,7 @@ members = [
     "crates/rsemu-svd",
     "crates/rsemu-targets",
     "apps/rsemu-cli",
+    "crates/rsemu-peripherals",
 ]
 exclude = ["stm32f1xx-hal", "stm32-emulator", "stm32f4xx-hal"]
 resolver = "2"
@@ -12,6 +13,24 @@ resolver = "2"
 edition = "2024"
 license = "MIT"
 version = "0.1.0"
+
+[workspace.dependencies]
+# Internal crates
+rsemu-core = { path = "crates/rsemu-core" }
+rsemu-svd = { path = "crates/rsemu-svd" }
+rsemu-targets = { path = "crates/rsemu-targets" }
+rsemu-peripherals = { path = "crates/rsemu-peripherals" }
+
+# External crates
+unicorn-engine = "2.1.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "time"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+minifb = "0.27"
+itertools = "0.13"
+log = "0.4"
+toml = "0.8"
 
 [profile.release]
 opt-level = 3

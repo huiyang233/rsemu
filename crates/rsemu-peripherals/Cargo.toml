@@ -1,16 +1,17 @@
 [package]
-name = "rsemu-cli"
+name = "rsemu-peripherals"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 rsemu-core.workspace = true
-rsemu-peripherals.workspace = true
-rsemu-targets.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
-minifb.workspace = true
 log.workspace = true
 serde.workspace = true
-toml.workspace = true
+serde_yaml.workspace = true
+minifb = { workspace = true, optional = true }
+
+[features]
+default = ["gui"]
+gui = ["minifb"]

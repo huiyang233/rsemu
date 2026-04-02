@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use tracing::trace;
 
 use crate::bus::SystemBus;
 use crate::cpu::CpuCore;
@@ -38,6 +39,8 @@ const META_RCC_CONTROL: u16 = 1 << 4;
 const META_TIMER_STATUS: u16 = 1 << 5;
 const META_GPIO_BSRR: u16 = 1 << 6;
 const META_RCC_CFGR: u16 = 1 << 7;
+const META_RCC_CSR: u16 = 1 << 8;
+const META_PWR_CSR: u16 = 1 << 9;
 
 #[derive(Debug, Clone)]
 struct SystickState {
@@ -45,6 +48,7 @@ struct SystickState {
     rvr_raw: u32,
     cvr: u32,
     countflag: bool,
+    pending_interrupts: u32,
     reload_divider: u32,
 }
 
@@ -55,6 +59,7 @@ impl SystickState {
             rvr_raw: 0,
             cvr: 0,
             countflag: false,
+            pending_interrupts: 0,
             reload_divider: reload_divider.max(1),
         }
     }
@@ -77,6 +82,7 @@ impl SystickState {
         if self.cvr == 0 {
             self.cvr = self.effective_period().saturating_sub(1);
             self.countflag = true;
+            self.pending_interrupts = self.pending_interrupts.saturating_add(1);
         } else {
             self.cvr = self.cvr.wrapping_sub(1);
         }
@@ -86,6 +92,14 @@ impl SystickState {
         for _ in 0..ticks {
             self.tick();
         }
+    }
+
+    fn take_pending_interrupt(&mut self) -> bool {
+        if self.pending_interrupts == 0 {
+            return false;
+        }
+        self.pending_interrupts = self.pending_interrupts.saturating_sub(1);
+        true
     }
 
     fn read8(&mut self, reg: SystickReg, byte_offset: u8) -> u8 {
@@ -122,6 +136,7 @@ impl SystickState {
             SystickReg::Val => {
                 self.cvr = 0;
                 self.countflag = false;
+                self.pending_interrupts = 0;
             }
             SystickReg::Calib => {}
         }
@@ -174,6 +189,16 @@ struct RccRegs {
     apb1enr: Option<u64>,
 }
 
+pub trait MachineBusInterface {
+    fn read_mmio(&self, addr: u64) -> u8;
+}
+
+impl<C: CpuCore> MachineBusInterface for Machine<C> {
+    fn read_mmio(&self, addr: u64) -> u8 {
+        self.mmio.get(&addr).copied().unwrap_or(0)
+    }
+}
+
 pub struct Machine<C: CpuCore> {
     cpu: C,
     target: TargetSpec,
@@ -185,6 +210,8 @@ pub struct Machine<C: CpuCore> {
     memory: Vec<MemoryBlock>,
     mmio: HashMap<u64, u8>,
     register_meta: HashMap<u64, RegisterMeta>,
+    usart_peripheral_map: HashMap<String, (u64, u64)>,
+    usart_rx_queues: HashMap<u64, VecDeque<u8>>,
     serial_output: Vec<SerialEvent>,
     mmio_writes: Vec<MmioWriteEvent>,
     systick: SystickState,
@@ -227,11 +254,24 @@ impl<C: CpuCore> Machine<C> {
 
         let mut mmio = HashMap::new();
         let mut register_meta = HashMap::new();
+        let mut usart_peripheral_map = HashMap::new();
         for peripheral in &target.peripherals {
             let spi_sr_addr = peripheral
                 .registers
                 .iter()
                 .find(|r| r.name.eq_ignore_ascii_case("SR"))
+                .map(|r| r.address)
+                .unwrap_or(0);
+            let usart_sr_addr = peripheral
+                .registers
+                .iter()
+                .find(|r| r.name.eq_ignore_ascii_case("SR"))
+                .map(|r| r.address)
+                .unwrap_or(0);
+            let usart_dr_addr = peripheral
+                .registers
+                .iter()
+                .find(|r| r.name.eq_ignore_ascii_case("DR"))
                 .map(|r| r.address)
                 .unwrap_or(0);
             let gpio_odr_addr = peripheral
@@ -240,12 +280,22 @@ impl<C: CpuCore> Machine<C> {
                 .find(|r| r.name.eq_ignore_ascii_case("ODR"))
                 .map(|r| r.address)
                 .unwrap_or(0);
+            if peripheral.name.starts_with("USART") || peripheral.name.starts_with("UART") {
+                if usart_sr_addr != 0 && usart_dr_addr != 0 {
+                    usart_peripheral_map.insert(
+                        peripheral.name.to_ascii_uppercase(),
+                        (usart_sr_addr, usart_dr_addr),
+                    );
+                }
+            }
 
             for register in &peripheral.registers {
                 let flags = classify_meta_flags(&peripheral.name, &register.name);
                 let systick = classify_systick_reg(&peripheral.name, &register.name);
                 let paired_addr = if flags & META_SPI_DATA != 0 || flags & META_SPI_STATUS != 0 {
                     spi_sr_addr
+                } else if flags & META_USART_DATA != 0 || flags & META_USART_STATUS != 0 {
+                    usart_sr_addr
                 } else if flags & META_GPIO_BSRR != 0 {
                     gpio_odr_addr
                 } else {
@@ -286,6 +336,8 @@ impl<C: CpuCore> Machine<C> {
             memory,
             mmio,
             register_meta,
+            usart_peripheral_map,
+            usart_rx_queues: HashMap::new(),
             serial_output: Vec::new(),
             mmio_writes: Vec::new(),
             systick: SystickState::new(reload_divider),
@@ -337,16 +389,20 @@ impl<C: CpuCore> Machine<C> {
             periph_bb_alias_end: self.periph_bb_alias_end,
             mmio: &mut self.mmio,
             register_meta: &self.register_meta,
+            usart_rx_queues: &mut self.usart_rx_queues,
             serial_output: &mut self.serial_output,
             mmio_writes: &mut self.mmio_writes,
             systick: &mut self.systick,
             nvic_any_enabled: &mut self.nvic_any_enabled,
-            current_pc: 0,
         };
         self.cpu.reset(&mut bus, vector_table_base)
     }
 
-    pub fn step_cpu(&mut self) -> Result<(), String> {
+    pub fn read_mmio(&self, addr: u64) -> u8 {
+        self.mmio.get(&addr).copied().unwrap_or(0)
+    }
+
+    pub fn step_cpu(&mut self, max_steps: usize) -> Result<u32, String> {
         let mut bus = MachineBus {
             memory: &mut self.memory,
             flash_base: self.flash_base,
@@ -356,20 +412,18 @@ impl<C: CpuCore> Machine<C> {
             periph_bb_alias_end: self.periph_bb_alias_end,
             mmio: &mut self.mmio,
             register_meta: &self.register_meta,
+            usart_rx_queues: &mut self.usart_rx_queues,
             serial_output: &mut self.serial_output,
             mmio_writes: &mut self.mmio_writes,
             systick: &mut self.systick,
             nvic_any_enabled: &mut self.nvic_any_enabled,
-            current_pc: self.cpu.program_counter(),
         };
-        self.cpu.step(&mut bus)?;
-        self.systick.tick();
-        let emu_cycles = self.target.systick_reload_divider.max(1) as u64;
+        let ran = self.cpu.step(&mut bus, max_steps)?;
+        self.systick.tick_many(ran as u64);
+        let emu_cycles = (self.target.systick_reload_divider.max(1) as u64) * (ran as u64);
         self.advance_timers(emu_cycles);
-        if self.nvic_any_enabled {
-            self.try_service_interrupt()?;
-        }
-        Ok(())
+        self.try_service_interrupt()?;
+        Ok(ran)
     }
 
     pub fn advance_systick_ticks(&mut self, ticks: u64) {
@@ -386,11 +440,11 @@ impl<C: CpuCore> Machine<C> {
             periph_bb_alias_end: self.periph_bb_alias_end,
             mmio: &mut self.mmio,
             register_meta: &self.register_meta,
+            usart_rx_queues: &mut self.usart_rx_queues,
             serial_output: &mut self.serial_output,
             mmio_writes: &mut self.mmio_writes,
             systick: &mut self.systick,
             nvic_any_enabled: &mut self.nvic_any_enabled,
-            current_pc: 0,
         };
         bus.read8(addr)
     }
@@ -405,13 +459,28 @@ impl<C: CpuCore> Machine<C> {
             periph_bb_alias_end: self.periph_bb_alias_end,
             mmio: &mut self.mmio,
             register_meta: &self.register_meta,
+            usart_rx_queues: &mut self.usart_rx_queues,
             serial_output: &mut self.serial_output,
             mmio_writes: &mut self.mmio_writes,
             systick: &mut self.systick,
             nvic_any_enabled: &mut self.nvic_any_enabled,
-            current_pc: 0,
         };
         bus.write8(addr, value)
+    }
+
+    pub fn usart_push_rx_byte(&mut self, peripheral: &str, byte: u8) -> Result<(), String> {
+        let key = peripheral.to_ascii_uppercase();
+        let (sr_addr, dr_addr) = self
+            .usart_peripheral_map
+            .get(&key)
+            .copied()
+            .ok_or_else(|| format!("unknown USART peripheral: {peripheral}"))?;
+        self.usart_rx_queues
+            .entry(sr_addr)
+            .or_default()
+            .push_back(byte);
+        self.mmio.insert(dr_addr, byte);
+        Ok(())
     }
 
     pub fn serial_output(&self) -> &[SerialEvent] {
@@ -432,8 +501,63 @@ impl<C: CpuCore> Machine<C> {
             return Ok(());
         }
 
+        // PendSV (Exception 14), used by RTOS context switching.
+        let icsr = read_mmio_u32(&self.mmio, 0xE000_ED04);
+        if (icsr & (1 << 28)) != 0 {
+            let cleared = icsr & !(1 << 28);
+            write_mmio_u32(&mut self.mmio, 0xE000_ED04, cleared);
+            self.service_exception(14)?;
+            return Ok(());
+        }
+
+        // Check Systick first (Exception 15)
+        if (self.systick.csr & 0x3) == 0x3 && self.systick.take_pending_interrupt() {
+            // Systick enabled, interrupt enabled, and it just rolled over
+            self.service_exception(15)?;
+            return Ok(());
+        }
+
         if let Some(irq) = self.next_pending_enabled_irq() {
             self.service_irq(irq)?;
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn service_exception(&mut self, exception_number: u16) -> Result<(), String> {
+        let vector_table_base = read_mmio_u32(&self.mmio, 0xE000_ED08) as u64;
+        let vector_table_base = if vector_table_base == 0 {
+            self.target.vector_table_base
+        } else {
+            vector_table_base
+        };
+
+        let mut bus = MachineBus {
+            memory: &mut self.memory,
+            flash_base: self.flash_base,
+            flash_alias_base: self.flash_alias_base,
+            periph_bb_base: self.periph_bb_base,
+            periph_bb_alias_start: self.periph_bb_alias_start,
+            periph_bb_alias_end: self.periph_bb_alias_end,
+            mmio: &mut self.mmio,
+            register_meta: &self.register_meta,
+            usart_rx_queues: &mut self.usart_rx_queues,
+            serial_output: &mut self.serial_output,
+            mmio_writes: &mut self.mmio_writes,
+            systick: &mut self.systick,
+            nvic_any_enabled: &mut self.nvic_any_enabled,
+        };
+        let entered = self
+            .cpu
+            .enter_exception(&mut bus, vector_table_base, exception_number)?;
+        if !entered {
+            if exception_number == 14 {
+                let icsr = read_mmio_u32(&self.mmio, 0xE000_ED04) | (1 << 28);
+                write_mmio_u32(&mut self.mmio, 0xE000_ED04, icsr);
+            } else if exception_number == 15 {
+                let icsr = read_mmio_u32(&self.mmio, 0xE000_ED04) | (1 << 26);
+                write_mmio_u32(&mut self.mmio, 0xE000_ED04, icsr);
+            }
         }
         Ok(())
     }
@@ -461,11 +585,11 @@ impl<C: CpuCore> Machine<C> {
             periph_bb_alias_end: self.periph_bb_alias_end,
             mmio: &mut self.mmio,
             register_meta: &self.register_meta,
+            usart_rx_queues: &mut self.usart_rx_queues,
             serial_output: &mut self.serial_output,
             mmio_writes: &mut self.mmio_writes,
             systick: &mut self.systick,
             nvic_any_enabled: &mut self.nvic_any_enabled,
-            current_pc: self.cpu.program_counter(),
         };
         let entered = self
             .cpu
@@ -526,19 +650,15 @@ impl<C: CpuCore> Machine<C> {
         let new_cnt = total % period;
         write_mmio_u32(&mut self.mmio, regs.cnt, new_cnt as u32);
 
-        if wraps == 0 {
-            return;
-        }
+        if wraps != 0 {
+            let sr = read_mmio_u32(&self.mmio, regs.sr) | 0x1;
+            write_mmio_u32(&mut self.mmio, regs.sr, sr);
+            if let Some(event) = decode_mmio_write(&self.register_meta, regs.sr, 4, sr) {
+                self.mmio_writes.push(event);
+            }
 
-        let sr = read_mmio_u32(&self.mmio, regs.sr) | 0x1;
-        write_mmio_u32(&mut self.mmio, regs.sr, sr);
-        if let Some(event) = decode_mmio_write(&self.register_meta, regs.sr, 4, sr) {
-            self.mmio_writes.push(event);
-        }
-
-        let dier = read_mmio_u32(&self.mmio, regs.dier);
-        if (dier & 0x1) != 0 {
-            if let Some(irq) = irq {
+            let dier = read_mmio_u32(&self.mmio, regs.dier);
+            if (dier & 0x1) != 0 && let Some(irq) = irq {
                 nvic_pending_write(&mut self.mmio, irq, true);
             }
         }
@@ -658,11 +778,11 @@ struct MachineBus<'a> {
     periph_bb_alias_end: Option<u64>,
     mmio: &'a mut HashMap<u64, u8>,
     register_meta: &'a HashMap<u64, RegisterMeta>,
+    usart_rx_queues: &'a mut HashMap<u64, VecDeque<u8>>,
     serial_output: &'a mut Vec<SerialEvent>,
     mmio_writes: &'a mut Vec<MmioWriteEvent>,
     systick: &'a mut SystickState,
     nvic_any_enabled: &'a mut bool,
-    current_pc: u64,
 }
 
 impl SystemBus for MachineBus<'_> {
@@ -686,25 +806,38 @@ impl SystemBus for MachineBus<'_> {
             if let Some(reg) = meta.systick {
                 return Ok(self.systick.read8(reg, meta.byte_offset));
             }
+            if meta.peripheral.eq_ignore_ascii_case("RCC") {
+                if meta.register.eq_ignore_ascii_case("CR")
+                    || meta.register.eq_ignore_ascii_case("CSR")
+                    || meta.register.eq_ignore_ascii_case("BDCR")
+                {
+                    let base_addr = addr & !3;
+                    let raw = read_mmio_u32(self.mmio, base_addr);
+                    let patched = apply_rcc_ready_flags(base_addr, raw, raw);
+                    let byte = ((patched >> ((meta.byte_offset as u32) * 8)) & 0xFF) as u8;
+                    return Ok(byte);
+                }
+            }
             if is_usart_status(meta) {
-                return Ok(match meta.byte_offset {
-                    0 => 0xC0,
-                    1 => 0x00,
-                    _ => 0x00,
-                });
+                let has_rx = self
+                    .usart_rx_queues
+                    .get(&meta.paired_addr)
+                    .is_some_and(|q| !q.is_empty());
+                let sr = 0x0000_00C0u32 | if has_rx { 1 << 5 } else { 0 };
+                return Ok(((sr >> ((meta.byte_offset as u32) * 8)) & 0xFF) as u8);
+            }
+            if is_usart_data(meta) && meta.byte_offset == 0 {
+                if let Some(queue) = self.usart_rx_queues.get_mut(&meta.paired_addr)
+                    && let Some(byte) = queue.pop_front()
+                {
+                    self.mmio.insert(addr, byte);
+                    return Ok(byte);
+                }
+                return Ok(self.mmio.get(&addr).copied().unwrap_or(0));
             }
             if is_spi_status(meta) {
                 let sr = spi_sr_sanitized(self.mmio, meta.paired_addr);
                 let byte = ((sr >> ((meta.byte_offset as u32) * 8)) & 0xFF) as u8;
-                if meta.byte_offset == 0
-                    && ((byte & (1 << 5)) != 0
-                        || std::env::var_os("RSEMU_TRACE_SPI_SR").is_some())
-                {
-                    eprintln!(
-                        "trace.spi.sr pc=0x{:08x} addr=0x{addr:08x} value=0x{byte:02x}",
-                        self.current_pc
-                    );
-                }
                 return Ok(byte);
             }
             if is_spi_data(meta) && meta.byte_offset == 0 {
@@ -719,6 +852,38 @@ impl SystemBus for MachineBus<'_> {
             .copied()
             .or_else(|| is_peripheral_addr(addr).then_some(0))
             .ok_or_else(|| format!("read from unmapped address 0x{addr:08x}"))
+    }
+
+    fn read_block(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), String> {
+        if addr < 0x4000_0000 {
+            for block in self.memory.iter() {
+                if block.contains(addr) && block.contains(addr + buf.len() as u64 - 1) {
+                    let offset = (addr - block.base()) as usize;
+                    buf.copy_from_slice(&block.data()[offset..offset + buf.len()]);
+                    return Ok(());
+                }
+            }
+        }
+        for (i, byte) in buf.iter_mut().enumerate() {
+            *byte = self.read8(addr + i as u64)?;
+        }
+        Ok(())
+    }
+
+    fn write_block(&mut self, addr: u64, buf: &[u8]) -> Result<(), String> {
+        if addr < 0x4000_0000 {
+            for block in self.memory.iter_mut() {
+                if block.writable() && block.contains(addr) && block.contains(addr + buf.len() as u64 - 1) {
+                    let offset = (addr - block.base()) as usize;
+                    block.data_mut()[offset..offset + buf.len()].copy_from_slice(buf);
+                    return Ok(());
+                }
+            }
+        }
+        for (i, &byte) in buf.iter().enumerate() {
+            self.write8(addr + i as u64, byte)?;
+        }
+        Ok(())
     }
 
     #[inline]
@@ -744,10 +909,10 @@ impl SystemBus for MachineBus<'_> {
 
     fn write8(&mut self, addr: u64, value: u8) -> Result<(), String> {
         // Fast path: memory blocks
-        if addr < 0x4000_0000 {
-            if let Some(block) = self.memory.iter_mut().find(|block| block.contains(addr)) {
-                return block.write8(addr, value);
-            }
+        if addr < 0x4000_0000
+            && let Some(block) = self.memory.iter_mut().find(|block| block.contains(addr))
+        {
+            return block.write8(addr, value);
         }
 
         if write_special_mmio(
@@ -794,10 +959,10 @@ impl SystemBus for MachineBus<'_> {
     #[inline]
     fn write16(&mut self, addr: u64, value: u16) -> Result<(), String> {
         // Fast path: native 16-bit write to memory blocks
-        if addr < 0x4000_0000 {
-            if let Some(block) = self.memory.iter_mut().find(|block| block.contains(addr)) {
-                return block.write16(addr, value);
-            }
+        if addr < 0x4000_0000
+            && let Some(block) = self.memory.iter_mut().find(|block| block.contains(addr))
+        {
+            return block.write16(addr, value);
         }
         // Fallback to 2x write8 for MMIO
         self.write8(addr, (value & 0xFF) as u8)?;
@@ -820,25 +985,51 @@ impl SystemBus for MachineBus<'_> {
             }
         }
 
-        if let Some(meta) = self.register_meta.get(&addr) {
-            if meta.byte_offset == 0 {
-                if let Some(reg) = meta.systick {
-                    return Ok(self.systick.read32(reg));
+        if let Some(meta) = self.register_meta.get(&addr)
+            && meta.byte_offset == 0
+        {
+            if let Some(reg) = meta.systick {
+                return Ok(self.systick.read32(reg));
+            }
+            if meta.peripheral.eq_ignore_ascii_case("RCC") {
+                if meta.register.eq_ignore_ascii_case("CR")
+                    || meta.register.eq_ignore_ascii_case("CSR")
+                    || meta.register.eq_ignore_ascii_case("BDCR")
+                {
+                    let raw = read_mmio_u32(self.mmio, addr);
+                    return Ok(apply_rcc_ready_flags(addr, raw, raw));
                 }
-                if is_usart_status(meta) {
-                    return Ok(0x0000_00C0);
+            }
+            if is_usart_status(meta) {
+                let has_rx = self
+                    .usart_rx_queues
+                    .get(&meta.paired_addr)
+                    .is_some_and(|q| !q.is_empty());
+                return Ok(0x0000_00C0u32 | if has_rx { 1 << 5 } else { 0 });
+            }
+            if is_usart_data(meta) {
+                let mut b0 = self.mmio.get(&addr).copied().unwrap_or(0) as u32;
+                if let Some(queue) = self.usart_rx_queues.get_mut(&meta.paired_addr)
+                    && let Some(byte) = queue.pop_front()
+                {
+                    b0 = u32::from(byte);
+                    self.mmio.insert(addr, byte);
                 }
-                if is_spi_status(meta) {
-                    return Ok(spi_sr_sanitized(self.mmio, meta.paired_addr));
-                }
-                if is_spi_data(meta) {
-                    let b0 = self.mmio.get(&addr).copied().unwrap_or(0) as u32;
-                    let b1 = self.mmio.get(&(addr + 1)).copied().unwrap_or(0) as u32;
-                    let b2 = self.mmio.get(&(addr + 2)).copied().unwrap_or(0) as u32;
-                    let b3 = self.mmio.get(&(addr + 3)).copied().unwrap_or(0) as u32;
-                    spi_mark_data_consumed(self.mmio, meta.paired_addr);
-                    return Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
-                }
+                let b1 = self.mmio.get(&(addr + 1)).copied().unwrap_or(0) as u32;
+                let b2 = self.mmio.get(&(addr + 2)).copied().unwrap_or(0) as u32;
+                let b3 = self.mmio.get(&(addr + 3)).copied().unwrap_or(0) as u32;
+                return Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            }
+            if is_spi_status(meta) {
+                return Ok(spi_sr_sanitized(self.mmio, meta.paired_addr));
+            }
+            if is_spi_data(meta) {
+                let b0 = self.mmio.get(&addr).copied().unwrap_or(0) as u32;
+                let b1 = self.mmio.get(&(addr + 1)).copied().unwrap_or(0) as u32;
+                let b2 = self.mmio.get(&(addr + 2)).copied().unwrap_or(0) as u32;
+                let b3 = self.mmio.get(&(addr + 3)).copied().unwrap_or(0) as u32;
+                spi_mark_data_consumed(self.mmio, meta.paired_addr);
+                return Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
             }
         }
 
@@ -847,7 +1038,9 @@ impl SystemBus for MachineBus<'_> {
             let b1 = self.mmio.get(&(addr + 1)).copied().unwrap_or(0) as u32;
             let b2 = self.mmio.get(&(addr + 2)).copied().unwrap_or(0) as u32;
             let b3 = self.mmio.get(&(addr + 3)).copied().unwrap_or(0) as u32;
-            return Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            let val = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            trace!("mmio.read32 @ 0x{:08x} -> 0x{:08x}", addr, val);
+            return Ok(val);
         }
 
         Err(format!("read from unmapped address 0x{addr:08x}"))
@@ -855,10 +1048,10 @@ impl SystemBus for MachineBus<'_> {
 
     fn write32(&mut self, addr: u64, value: u32) -> Result<(), String> {
         // Fast path: native 32-bit write to memory blocks
-        if addr < 0x4000_0000 {
-            if let Some(block) = self.memory.iter_mut().find(|block| block.contains(addr)) {
-                return block.write32(addr, value);
-            }
+        if addr < 0x4000_0000
+            && let Some(block) = self.memory.iter_mut().find(|block| block.contains(addr))
+        {
+            return block.write32(addr, value);
         }
 
         if write_special_mmio_u32(
@@ -969,7 +1162,7 @@ fn flash_alias_read32(
 }
 
 fn is_peripheral_addr(addr: u64) -> bool {
-    (0x4000_0000..0x6000_0000).contains(&addr) || (0xE000_0000..0xF000_0000).contains(&addr)
+    (0x4000_0000..0xF000_0000).contains(&addr)
 }
 
 fn is_nvic_enable_addr(addr: u64) -> bool {
@@ -1114,6 +1307,29 @@ fn write_special_mmio(
     value: u8,
 ) -> bool {
     if let Some(meta) = register_meta.get(&addr).cloned() {
+        if is_rcc_control(&meta) || is_rcc_csr(&meta) || is_pwr_csr(&meta) {
+            let base_addr = addr & !3;
+            let old_val = read_mmio_u32(mmio, base_addr);
+            let merged = merge_mmio_write(old_val, addr, 1, value as u32);
+            let updated = apply_rcc_ready_flags(base_addr, old_val, merged);
+            write_mmio_u32(mmio, base_addr, updated);
+            if let Some(event) = decode_mmio_write(register_meta, base_addr, 4, updated) {
+                mmio_writes.push(event);
+            }
+            return true;
+        }
+        if is_rcc_cfgr(&meta) {
+            let base_addr = addr & !3;
+            let old_val = read_mmio_u32(mmio, base_addr);
+            let merged = merge_mmio_write(old_val, addr, 1, value as u32);
+            let updated = apply_rcc_cfgr_flags(merged);
+            write_mmio_u32(mmio, base_addr, updated);
+            if let Some(event) = decode_mmio_write(register_meta, base_addr, 4, updated) {
+                mmio_writes.push(event);
+            }
+            return true;
+        }
+
         if let Some(reg) = meta.systick {
             systick.write8(reg, meta.byte_offset, value);
             mmio.insert(addr, value);
@@ -1156,8 +1372,53 @@ fn write_special_mmio_u32(
     value: u32,
 ) -> bool {
     if let Some(meta) = register_meta.get(&addr).cloned() {
-        if meta.byte_offset == 0 {
-            if let Some(reg) = meta.systick {
+        if is_rcc_control(&meta) {
+            let base_addr = addr & !3;
+            let old_val = read_mmio_u32(mmio, base_addr);
+            let merged = merge_mmio_write(old_val, addr, 4, value);
+            let updated = apply_rcc_ready_flags(base_addr, old_val, merged);
+            write_mmio_u32(mmio, base_addr, updated);
+            if let Some(event) = decode_mmio_write(register_meta, base_addr, 4, updated) {
+                mmio_writes.push(event);
+            }
+            return true;
+        }
+        if is_rcc_cfgr(&meta) {
+            let base_addr = addr & !3;
+            let old_val = read_mmio_u32(mmio, base_addr);
+            let merged = merge_mmio_write(old_val, addr, 4, value);
+            let updated = apply_rcc_cfgr_flags(merged);
+            write_mmio_u32(mmio, base_addr, updated);
+            if let Some(event) = decode_mmio_write(register_meta, base_addr, 4, updated) {
+                mmio_writes.push(event);
+            }
+            return true;
+        }
+        if is_rcc_csr(&meta) {
+            let base_addr = addr & !3;
+            let old_val = read_mmio_u32(mmio, base_addr);
+            let merged = merge_mmio_write(old_val, addr, 4, value);
+            let updated = apply_rcc_ready_flags(base_addr, old_val, merged);
+            write_mmio_u32(mmio, base_addr, updated);
+            if let Some(event) = decode_mmio_write(register_meta, base_addr, 4, updated) {
+                mmio_writes.push(event);
+            }
+            return true;
+        }
+        if is_pwr_csr(&meta) {
+            let base_addr = addr & !3;
+            let old_val = read_mmio_u32(mmio, base_addr);
+            let merged = merge_mmio_write(old_val, addr, 4, value);
+            let updated = apply_rcc_ready_flags(base_addr, old_val, merged);
+            write_mmio_u32(mmio, base_addr, updated);
+            if let Some(event) = decode_mmio_write(register_meta, base_addr, 4, updated) {
+                mmio_writes.push(event);
+            }
+            return true;
+        }
+
+        if let Some(reg) = meta.systick {
+            if meta.byte_offset == 0 {
                 systick.write32(reg, value);
                 for (index, byte) in value.to_le_bytes().iter().enumerate() {
                     mmio.insert(addr + index as u64, *byte);
@@ -1167,26 +1428,10 @@ fn write_special_mmio_u32(
                 }
                 return true;
             }
-            if is_rcc_control(&meta) {
-                let value = apply_rcc_ready_flags(value);
-                for (index, byte) in value.to_le_bytes().iter().enumerate() {
-                    mmio.insert(addr + index as u64, *byte);
-                }
-                if let Some(event) = decode_mmio_write(register_meta, addr, 4, value) {
-                    mmio_writes.push(event);
-                }
-                return true;
-            }
-            if is_rcc_cfgr(&meta) {
-                let value = apply_rcc_cfgr_flags(value);
-                for (index, byte) in value.to_le_bytes().iter().enumerate() {
-                    mmio.insert(addr + index as u64, *byte);
-                }
-                if let Some(event) = decode_mmio_write(register_meta, addr, 4, value) {
-                    mmio_writes.push(event);
-                }
-                return true;
-            }
+        }
+
+        if meta.byte_offset == 0 {
+
             if is_timer_status(&meta) {
                 let current = read_mmio_u32(mmio, addr);
                 let merged = current & value;
@@ -1243,6 +1488,7 @@ fn write_special_mmio_u32(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_periph_bitband_alias(
     mmio: &mut HashMap<u64, u8>,
     mmio_writes: &mut Vec<MmioWriteEvent>,
@@ -1315,12 +1561,22 @@ fn is_rcc_cfgr(meta: &RegisterMeta) -> bool {
     (meta.flags & META_RCC_CFGR) != 0
 }
 
+fn is_rcc_csr(meta: &RegisterMeta) -> bool {
+    (meta.flags & META_RCC_CSR) != 0
+}
+
+fn is_pwr_csr(meta: &RegisterMeta) -> bool {
+    (meta.flags & META_PWR_CSR) != 0
+}
+
 fn classify_meta_flags(peripheral: &str, register: &str) -> u16 {
     let mut flags = 0u16;
-    if peripheral.starts_with("USART") && register.eq_ignore_ascii_case("SR") {
+    let is_uart_like =
+        peripheral.starts_with("USART") || peripheral.starts_with("UART");
+    if is_uart_like && register.eq_ignore_ascii_case("SR") {
         flags |= META_USART_STATUS;
     }
-    if peripheral.starts_with("USART") && register.eq_ignore_ascii_case("DR") {
+    if is_uart_like && register.eq_ignore_ascii_case("DR") {
         flags |= META_USART_DATA;
     }
     if peripheral.starts_with("SPI") && register.eq_ignore_ascii_case("SR") {
@@ -1334,6 +1590,12 @@ fn classify_meta_flags(peripheral: &str, register: &str) -> u16 {
     }
     if peripheral.eq_ignore_ascii_case("RCC") && register.eq_ignore_ascii_case("CFGR") {
         flags |= META_RCC_CFGR;
+    }
+    if peripheral.eq_ignore_ascii_case("RCC") && register.eq_ignore_ascii_case("CSR") {
+        flags |= META_RCC_CSR;
+    }
+    if peripheral.eq_ignore_ascii_case("PWR") && register.eq_ignore_ascii_case("CSR") {
+        flags |= META_PWR_CSR;
     }
     if peripheral.starts_with("TIM") && register.eq_ignore_ascii_case("SR") {
         flags |= META_TIMER_STATUS;
@@ -1400,19 +1662,48 @@ fn spi_mark_data_consumed(mmio: &mut HashMap<u64, u8>, sr_addr: u64) {
     }
 }
 
-fn apply_rcc_ready_flags(mut value: u32) -> u32 {
-    // Simplified clock-ready model: when oscillator/PLL is enabled, mark it ready immediately.
-    // This keeps HAL clock init loops from stalling forever on readiness polling.
-    value = (value & !(1 << 1)) | (((value >> 0) & 1) << 1);
-    value = (value & !(1 << 17)) | (((value >> 16) & 1) << 17);
-    value = (value & !(1 << 25)) | (((value >> 24) & 1) << 25);
-    value
+fn apply_rcc_ready_flags(addr: u64, _old_val: u32, mut new_val: u32) -> u32 {
+    // Aggressively set RDY bits for common RCC/PWR registers to bypass HAL init loops.
+    
+    if addr & !3 == 0x40023800 { // RCC_CR
+        if (new_val & (1 << 0)) != 0 { new_val |= 1 << 1; } else { new_val &= !(1 << 1); }   // HSIRDY
+        if (new_val & (1 << 16)) != 0 { new_val |= 1 << 17; } else { new_val &= !(1 << 17); } // HSERDY
+        if (new_val & (1 << 24)) != 0 { new_val |= 1 << 25; } else { new_val &= !(1 << 25); } // PLLRDY
+        if (new_val & (1 << 26)) != 0 { new_val |= 1 << 27; } else { new_val &= !(1 << 27); } // PLLI2SRDY
+        if (new_val & (1 << 28)) != 0 { new_val |= 1 << 29; } else { new_val &= !(1 << 29); } // PLLSAIRDY
+    } else if addr & !3 == 0x40023874 { // RCC_CSR
+        if (new_val & (1 << 0)) != 0 { new_val |= 1 << 1; } else { new_val &= !(1 << 1); }   // LSIRDY
+    } else if addr & !3 == 0x40023870 { // RCC_BDCR
+        if (new_val & (1 << 0)) != 0 { new_val |= 1 << 1; } else { new_val &= !(1 << 1); }   // LSERDY
+    } else if addr & !3 == 0x40007004 { // PWR_CSR
+        new_val |= 1 << 14; // VOSRDY
+    }
+
+    new_val
 }
 
 fn apply_rcc_cfgr_flags(value: u32) -> u32 {
     let sw = value & 0x3;
     let sws = sw << 2;
     (value & !(0x3 << 2)) | sws
+}
+
+fn merge_mmio_write(old_val: u32, addr: u64, width: u8, value: u32) -> u32 {
+    let offset = (addr & 3) as u32;
+    let shift = offset * 8;
+    let bit_width = (width as u32) * 8;
+    
+    // Mask for the bits being updated
+    let mask = if bit_width >= 32 {
+        0xFFFF_FFFFu32
+    } else {
+        ((1u32 << bit_width).wrapping_sub(1)) << shift
+    };
+    
+    // Ensure the new bits are shifted to the correct byte lane and masked
+    let new_bits = (value << shift) & mask;
+    
+    (old_val & !mask) | new_bits
 }
 
 fn decode_mmio_write(
