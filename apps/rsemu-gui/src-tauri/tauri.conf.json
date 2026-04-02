@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schemas.tauri.app/config/v2/tauri.config.json",
+  "productName": "rsemu-gui",
+  "version": "0.1.0",
+  "identifier": "com.rsemu.gui",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "rsemu GUI",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 1024,
+        "minHeight": 600
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": []
+  }
+}

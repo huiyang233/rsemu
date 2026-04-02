@@ -4,6 +4,7 @@ members = [
     "crates/rsemu-svd",
     "crates/rsemu-targets",
     "apps/rsemu-cli",
+    "apps/rsemu-gui/src-tauri",
     "crates/rsemu-peripherals",
 ]
 exclude = ["stm32f1xx-hal", "stm32-emulator", "stm32f4xx-hal"]
