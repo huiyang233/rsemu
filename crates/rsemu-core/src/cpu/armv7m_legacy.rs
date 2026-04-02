@@ -49,7 +49,9 @@ pub struct CortexM3 {
     arch: ArmV7MArchitecture,
     registers: [u32; 16],
     xpsr: u32,
-    it_state: Vec<u8>,
+    it_conds: [u8; 4],
+    it_pos: u8,
+    it_count: u8,
     decode_cache: [DecodeCacheEntry; DECODE_CACHE_SIZE],
 }
 
@@ -59,7 +61,9 @@ impl Default for CortexM3 {
             arch: ArmV7MArchitecture,
             registers: [0; 16],
             xpsr: 0,
-            it_state: Vec::new(),
+            it_conds: [0; 4],
+            it_pos: 0,
+            it_count: 0,
             decode_cache: [DecodeCacheEntry::default(); DECODE_CACHE_SIZE],
         }
     }
@@ -145,13 +149,19 @@ impl CortexM3 {
         }
     }
 
-    fn it_conditions(first_cond: u8, mask: u8) -> Option<Vec<u8>> {
+    fn set_it_state(&mut self, first_cond: u8, count: u8) {
+        self.it_conds[0] = first_cond;
+        for i in 1..count as usize {
+            self.it_conds[i] = first_cond;
+        }
+        self.it_pos = 0;
+        self.it_count = count;
+    }
+
+    fn it_count_from_mask(mask: u8) -> Option<u8> {
         match mask {
-            0x8 => Some(vec![first_cond]),
-            // ITT <cond>
-            0x4 => Some(vec![first_cond, first_cond]),
-            // Some toolchains encode `ITT <cond>` as mask 0xC as well.
-            0xC => Some(vec![first_cond, first_cond]),
+            0x8 => Some(1),
+            0x4 | 0xC => Some(2),
             _ => None,
         }
     }
@@ -790,21 +800,20 @@ impl CortexM3 {
             0xB400 => {
                 let reg_list = (opcode & 0xFF) as u8;
                 let include_lr = (opcode >> 8) & 1 == 1;
-                let mut registers = Vec::new();
-                for reg in 0..8 {
+                let mut count = reg_list.count_ones();
+                if include_lr {
+                    count += 1;
+                }
+                self.registers[13] = self.registers[13].wrapping_sub(count * 4);
+                let mut address = self.registers[13];
+                for reg in 0..8usize {
                     if (reg_list >> reg) & 1 == 1 {
-                        registers.push(reg);
+                        bus.write32(address as u64, self.registers[reg])?;
+                        address = address.wrapping_add(4);
                     }
                 }
                 if include_lr {
-                    registers.push(14);
-                }
-
-                self.registers[13] = self.registers[13].wrapping_sub((registers.len() as u32) * 4);
-                let mut address = self.registers[13];
-                for reg in registers {
-                    bus.write32(address as u64, self.registers[reg])?;
-                    address = address.wrapping_add(4);
+                    bus.write32(address as u64, self.registers[14])?;
                 }
                 self.registers[15] = self.registers[15].wrapping_add(2);
                 return Ok(true);
@@ -965,15 +974,16 @@ impl CortexM3 {
             }
             0xBF00 if (opcode & 0x000F) == 0x8 => {
                 let cond = ((opcode >> 4) & 0xF) as u8;
-                self.it_state = vec![cond];
+                self.set_it_state(cond, 1);
                 self.registers[15] = self.registers[15].wrapping_add(2);
                 return Ok(true);
             }
             0xBF00 if (opcode & 0x000F) != 0 => {
                 let cond = ((opcode >> 4) & 0xF) as u8;
                 let mask = (opcode & 0xF) as u8;
-                self.it_state = Self::it_conditions(cond, mask)
+                let count = Self::it_count_from_mask(mask)
                     .ok_or_else(|| format!("unimplemented IT mask 0x{mask:x} at PC 0x{pc:08x}"))?;
+                self.set_it_state(cond, count);
                 self.registers[15] = self.registers[15].wrapping_add(2);
                 return Ok(true);
             }
@@ -1996,8 +2006,9 @@ impl CpuCore for CortexM3 {
         let pc = self.program_counter();
         let (opcode, width) = self.fetch_opcode(bus, pc)?;
 
-        if let Some(cond) = self.it_state.first().copied() {
-            self.it_state.remove(0);
+        if self.it_pos < self.it_count {
+            let cond = self.it_conds[self.it_pos as usize];
+            self.it_pos += 1;
             if !self.condition_passed(cond) {
                 self.registers[15] = self.registers[15].wrapping_add(width);
                 return Ok(());
@@ -2035,7 +2046,8 @@ impl CpuCore for CortexM3 {
         self.registers[13] = initial_sp;
         self.registers[15] = reset_handler & !1;
         self.xpsr = 1 << 24;
-        self.it_state.clear();
+        self.it_pos = 0;
+        self.it_count = 0;
         self.decode_cache.fill(DecodeCacheEntry::default());
         Ok(())
     }

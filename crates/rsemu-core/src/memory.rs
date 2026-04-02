@@ -64,22 +64,81 @@ impl MemoryBlock {
         addr >= self.base && addr < self.end()
     }
 
+    #[inline]
     pub fn read8(&self, addr: u64) -> Option<u8> {
         if !self.contains(addr) {
             return None;
         }
-
         let offset = (addr - self.base) as usize;
-        self.data.get(offset).copied()
+        // Safety rationale: contains() already verified addr is in range,
+        // so offset < self.data.len() is guaranteed.
+        Some(unsafe { *self.data.get_unchecked(offset) })
     }
 
+    #[inline]
+    pub fn read16(&self, addr: u64) -> Option<u16> {
+        if addr < self.base || addr + 1 >= self.base + self.data.len() as u64 {
+            return None;
+        }
+        let offset = (addr - self.base) as usize;
+        let bytes = [self.data[offset], self.data[offset + 1]];
+        Some(u16::from_le_bytes(bytes))
+    }
+
+    #[inline]
+    pub fn read32(&self, addr: u64) -> Option<u32> {
+        if addr < self.base || addr + 3 >= self.base + self.data.len() as u64 {
+            return None;
+        }
+        let offset = (addr - self.base) as usize;
+        let bytes = [
+            self.data[offset],
+            self.data[offset + 1],
+            self.data[offset + 2],
+            self.data[offset + 3],
+        ];
+        Some(u32::from_le_bytes(bytes))
+    }
+
+    #[inline]
     pub fn write8(&mut self, addr: u64, value: u8) -> Result<(), String> {
         if !self.writable {
             return Err(format!("write to read-only memory 0x{addr:08x}"));
         }
-
         let offset = self.offset_of(addr)?;
         self.data[offset] = value;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn write16(&mut self, addr: u64, value: u16) -> Result<(), String> {
+        if !self.writable {
+            return Err(format!("write to read-only memory 0x{addr:08x}"));
+        }
+        if addr < self.base || addr + 1 >= self.base + self.data.len() as u64 {
+            return Err(format!("address 0x{addr:08x} is outside memory block"));
+        }
+        let offset = (addr - self.base) as usize;
+        let bytes = value.to_le_bytes();
+        self.data[offset] = bytes[0];
+        self.data[offset + 1] = bytes[1];
+        Ok(())
+    }
+
+    #[inline]
+    pub fn write32(&mut self, addr: u64, value: u32) -> Result<(), String> {
+        if !self.writable {
+            return Err(format!("write to read-only memory 0x{addr:08x}"));
+        }
+        if addr < self.base || addr + 3 >= self.base + self.data.len() as u64 {
+            return Err(format!("address 0x{addr:08x} is outside memory block"));
+        }
+        let offset = (addr - self.base) as usize;
+        let bytes = value.to_le_bytes();
+        self.data[offset] = bytes[0];
+        self.data[offset + 1] = bytes[1];
+        self.data[offset + 2] = bytes[2];
+        self.data[offset + 3] = bytes[3];
         Ok(())
     }
 

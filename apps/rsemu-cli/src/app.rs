@@ -1,31 +1,155 @@
 use crate::cli::CliArgs;
 use minifb::{Key, Scale, Window, WindowOptions};
+use rsemu_core::cpu::armv7em::CortexM4;
 use rsemu_core::cpu::armv7m::CortexM3;
-use rsemu_core::{CpuCore, FirmwareLoader, Machine, MmioWriteEvent};
+use rsemu_core::{CpuCore, FirmwareLoader, Machine, MmioWriteEvent, TargetSpec};
+use rsemu_peripherals::display::St7789;
+use rsemu_peripherals::led::Led;
+use rsemu_peripherals::{Peripheral, PinMapping};
 use rsemu_targets::stm32::{f103, f407};
+use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::Write as IoWrite;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
-
-const ENABLE_ST7789_CAPTURE: bool = true;
+use tracing::{debug, info};
 
 pub fn run() -> Result<(), String> {
     let args = CliArgs::parse()?;
-    let mut target = match args.target.as_deref() {
-        Some("STM32F407") | Some("f407") | Some("stm32f407") => f407::load_target(args.svd_xml.as_deref())?,
-        _ => f103::load_target(args.svd_xml.as_deref())?,
+    let board = load_board_config(&args.board_path)?;
+    let svd_xml = read_optional_string(resolve_path(
+        &args.board_path,
+        board.svd.as_deref(),
+    ))?;
+
+    let is_f407 = matches!(
+        board.target.as_deref(),
+        Some("STM32F407") | Some("f407") | Some("stm32f407")
+    );
+    let mut target = match board.target.as_deref() {
+        Some("STM32F407") | Some("f407") | Some("stm32f407") => f407::load_target(svd_xml.as_deref())?,
+        _ => f103::load_target(svd_xml.as_deref())?,
     };
-    if let Some(addr) = args.load_addr {
+
+    if let Some(addr) = board.load_addr {
         target.vector_table_base = addr as u64;
     }
-    let mut machine = Machine::new(CortexM3::new(), target.clone());
-    let has_firmware = args.firmware_path.is_some();
+    let firmware_path = resolve_path(&args.board_path, board.firmware.as_deref());
+    let cycle_scale = board.cycle_scale.unwrap_or(1).max(1);
 
-    if let Some(firmware_path) = args.firmware_path.as_deref() {
-        let load_addr = args.load_addr.unwrap_or(0x0800_0000);
+    if is_f407 {
+        let machine = Machine::new(CortexM4::new(), target.clone());
+        run_with_cpu(machine, target, &args, &board, firmware_path, cycle_scale)
+    } else {
+        let machine = Machine::new(CortexM3::new(), target.clone());
+        run_with_cpu(machine, target, &args, &board, firmware_path, cycle_scale)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BoardConfig {
+    target: Option<String>,
+    svd: Option<String>,
+    firmware: Option<String>,
+    load_addr: Option<u32>,
+    cycle_scale: Option<u32>,
+    #[serde(default)]
+    peripherals: Vec<BoardPeripheralConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+enum BoardPeripheralConfig {
+    #[serde(rename = "st7789")]
+    St7789 {
+        #[allow(dead_code)]
+        id: Option<String>,
+        #[serde(default = "default_true")]
+        enabled: bool,
+        width: u16,
+        height: u16,
+        spi_base: u64,
+        cs: PinMapping,
+        dc: PinMapping,
+        res: Option<PinMapping>,
+        #[serde(default)]
+        dump_frames: bool,
+        #[serde(default = "default_output_dir")]
+        output_dir: String,
+    },
+    #[serde(rename = "uart_terminal")]
+    UartTerminal {
+        #[allow(dead_code)]
+        id: Option<String>,
+        #[serde(default = "default_true")]
+        enabled: bool,
+        usart: String,
+        tx: PinMapping,
+        rx: PinMapping,
+    },
+    #[serde(rename = "led")]
+    Led {
+        id: Option<String>,
+        #[serde(default = "default_true")]
+        enabled: bool,
+        pin: PinMapping,
+        #[serde(default = "default_true")]
+        active_low: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct UartTerminalBinding {
+    usart: String,
+    tx: PinMapping,
+    rx: PinMapping,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_output_dir() -> String {
+    "/tmp/rsemu-frames".to_string()
+}
+
+fn load_board_config(path: &str) -> Result<BoardConfig, String> {
+    let raw = fs::read_to_string(path).map_err(|e| format!("read board config failed ({path}): {e}"))?;
+    toml::from_str(&raw).map_err(|e| format!("parse board config failed ({path}): {e}"))
+}
+
+fn resolve_path(board_path: &str, maybe_rel: Option<&str>) -> Option<String> {
+    let value = maybe_rel?;
+    let value_path = Path::new(value);
+    if value_path.is_absolute() {
+        return Some(value.to_string());
+    }
+    let board_dir = Path::new(board_path).parent().unwrap_or_else(|| Path::new("."));
+    let abs: PathBuf = board_dir.join(value_path);
+    Some(abs.to_string_lossy().into_owned())
+}
+
+fn read_optional_string(path: Option<String>) -> Result<Option<String>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let content = fs::read_to_string(&path).map_err(|e| format!("failed to read file {path}: {e}"))?;
+    Ok(Some(content))
+}
+
+fn run_with_cpu<C: CpuCore>(
+    mut machine: Machine<C>,
+    target: TargetSpec,
+    args: &CliArgs,
+    board: &BoardConfig,
+    firmware_path: Option<String>,
+    cycle_scale: u32,
+) -> Result<(), String> {
+    if let Some(firmware_path) = firmware_path.as_deref() {
+        let load_addr = board.load_addr.unwrap_or(0x0800_0000);
         let firmware = FirmwareLoader::load_file(firmware_path, load_addr as u64)?;
         machine.load_firmware(&firmware)?;
         machine.reset_cpu()?;
@@ -34,7 +158,6 @@ pub fn run() -> Result<(), String> {
     info!("target: {}", target.name);
     info!("architecture: {:?}", target.architecture);
     info!("cpu: {}", machine.cpu().architecture().name());
-    info!("cpu.backend: {:?}", machine.cpu().backend());
     info!("memory regions: {}", target.memory_map.len());
     info!("peripherals: {}", target.peripherals.len());
 
@@ -47,29 +170,13 @@ pub fn run() -> Result<(), String> {
         );
     }
 
-    if let Some(first_register) = target
-        .peripherals
-        .iter()
-        .flat_map(|peripheral| peripheral.registers.iter())
-        .next()
-    {
-        let value = machine.read8(first_register.address)?;
-        info!(
-            "probe register {} @ 0x{:08x} => 0x{:02x}",
-            first_register.name, first_register.address, value
-        );
-    }
-
-    if has_firmware {
+    if firmware_path.is_some() {
         let base_emu_cycles_per_step = ((u64::from(target.systick_reload_divider) * 3) / 5).max(1);
-        let emu_cycles_per_step =
-            (base_emu_cycles_per_step.saturating_mul(u64::from(args.cycle_scale))).min(u64::from(u32::MAX))
-                as u32;
-        info!("cpu.sp = 0x{:08x}", machine.cpu().stack_pointer());
-        info!("cpu.pc = 0x{:08x}", machine.cpu().program_counter());
+        let emu_cycles_per_step = (base_emu_cycles_per_step * (u64::from(cycle_scale))).max(1) as u32;
+
         info!(
             "clock.core = {} Hz, emu_step = {} cycles (scale x{})",
-            target.core_clock_hz, emu_cycles_per_step, args.cycle_scale
+            target.core_clock_hz, emu_cycles_per_step, cycle_scale
         );
 
         let mut steps = 0u64;
@@ -77,29 +184,121 @@ pub fn run() -> Result<(), String> {
         let mut recent_pcs = Vec::with_capacity(32);
         let mut serial_cursor = 0usize;
         let mut mmio_cursor = 0usize;
-        let mut st7789 = St7789Capture::new(
-            240,
-            320,
-            "/tmp/rsemu-st7789",
-            args.dump_frames,
-            args.display_gui,
-        );
+        
+        let mut peripherals: Vec<Box<dyn Peripheral>> = Vec::new();
+        let mut uart_bindings: Vec<UartTerminalBinding> = Vec::new();
+        let mut st7789_window_size: Option<(usize, usize)> = None;
+        for periph in &board.peripherals {
+            match periph {
+                BoardPeripheralConfig::St7789 {
+                    enabled,
+                    width,
+                    height,
+                    spi_base,
+                    cs,
+                    dc,
+                    res,
+                    dump_frames,
+                    output_dir,
+                    ..
+                } => {
+                    if !enabled {
+                        continue;
+                    }
+                    let preview_enabled = !args.no_gui;
+                    let panel_width = *width;
+                    let panel_height = *height;
+                    peripherals.push(Box::new(St7789::new(
+                        panel_width,
+                        panel_height,
+                        *spi_base,
+                        cs.clone(),
+                        dc.clone(),
+                        res.clone(),
+                        output_dir.clone(),
+                        *dump_frames || args.dump_frames,
+                        preview_enabled,
+                    )));
+                    if st7789_window_size.is_none() {
+                        st7789_window_size =
+                            Some((usize::from(panel_width), usize::from(panel_height)));
+                    }
+                }
+                BoardPeripheralConfig::UartTerminal {
+                    enabled,
+                    usart,
+                    tx,
+                    rx,
+                    ..
+                } => {
+                    if !enabled {
+                        continue;
+                    }
+                    uart_bindings.push(UartTerminalBinding {
+                        usart: usart.clone(),
+                        tx: tx.clone(),
+                        rx: rx.clone(),
+                    });
+                }
+                BoardPeripheralConfig::Led {
+                    id,
+                    enabled,
+                    pin,
+                    active_low,
+                } => {
+                    if !enabled {
+                        continue;
+                    }
+                    let led_id = id
+                        .clone()
+                        .unwrap_or_else(|| format!("{}{}", pin.port.to_ascii_uppercase(), pin.pin));
+                    peripherals.push(Box::new(Led::new(led_id, pin.clone(), *active_low)));
+                }
+            }
+        }
+        let mut uart_terminals = Vec::new();
+        let mut stdin_rx = Some(spawn_stdin_reader());
+        let multi_uart = uart_bindings.len() > 1;
+        for uart in &uart_bindings {
+            info!(
+                "uart.terminal = {} (TX P{}{}, RX P{}{})",
+                uart.usart, uart.tx.port, uart.tx.pin, uart.rx.port, uart.rx.pin
+            );
+            match UartTerminalConsole::new(&uart.usart, stdin_rx.take(), multi_uart) {
+                Ok(server) => uart_terminals.push(server),
+                Err(err) => info!("uart.terminal.{} = disabled ({err})", uart.usart),
+            }
+        }
+        if !uart_terminals.is_empty() {
+            println!("--- Serial Console ---");
+            println!("Input from keyboard will be sent to UART. Press Ctrl+C to exit.");
+            println!("----------------------");
+        }
+        let active_uart_filters: Option<Vec<String>> = if uart_bindings.is_empty() {
+            None
+        } else {
+            Some(uart_bindings.iter().map(|u| u.usart.clone()).collect())
+        };
+
         let mut serial_lines: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut pacer = RealtimePacer::new(target.core_clock_hz, emu_cycles_per_step);
         pacer.set_enabled(!args.fast_mode);
         let mut clocks = RccClockModel::new(target.core_clock_hz);
-        let mut gpio_log_limiter = GpioLogLimiter::new(Duration::from_millis(100));
         let heartbeat_interval = if args.fast_mode { 250_000u64 } else { 50_000u64 };
         let mut next_heartbeat_step = heartbeat_interval;
         let stream_interval_steps: u64 = if args.fast_mode { 4096 } else { 64 };
         let mut steps_since_stream = 0u64;
-        let mut display_gui = if args.display_gui {
-            match DisplayWindow::new("rsemu ST7789", 240, 320) {
-                Ok(window) => Some(window),
-                Err(err) => {
-                    info!("display.gui = disabled ({err})");
-                    None
+        let mut display_gui = if !args.no_gui {
+            if let Some((width, height)) = st7789_window_size {
+                match DisplayWindow::new("rsemu ST7789", width, height) {
+                    Ok(window) => Some(window),
+                    Err(err) => {
+                        info!("display.gui = disabled ({err})");
+                        None
+                    }
                 }
+            } else {
+                None
             }
         } else {
             None
@@ -109,39 +308,17 @@ pub fn run() -> Result<(), String> {
                 break;
             }
 
-            let pc = machine.cpu().program_counter();
-            if let (Some(start), Some(end)) = (args.trace_start, args.trace_end) {
-                if (start as u64..=end as u64).contains(&pc) {
-                    let regs = machine.cpu().registers();
-                    debug!(
-                        "trace.step pc=0x{pc:08x} r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x} r4=0x{:08x} r5=0x{:08x} r6=0x{:08x} r7=0x{:08x} r8=0x{:08x} r9=0x{:08x} r10=0x{:08x} r11=0x{:08x} r12=0x{:08x} sp=0x{:08x} lr=0x{:08x}",
-                        regs[0],
-                        regs[1],
-                        regs[2],
-                        regs[3],
-                        regs[4],
-                        regs[5],
-                        regs[6],
-                        regs[7],
-                        regs[8],
-                        regs[9],
-                        regs[10],
-                        regs[11],
-                        regs[12],
-                        regs[13],
-                        regs[14]
-                    );
-                }
-            }
-            if recent_pcs.len() == 32 {
-                recent_pcs.remove(0);
-            }
-            recent_pcs.push(pc);
+            match step_cpu_resilient(&mut machine, 1000) {
+                Ok(ran) => {
+                    steps += ran as u64;
+                    steps_since_stream = steps_since_stream.saturating_add(ran as u64);
 
-            match machine.step_cpu() {
-                Ok(()) => {
-                    steps += 1;
-                    steps_since_stream = steps_since_stream.saturating_add(1);
+                    let pc = machine.cpu().program_counter();
+                    if recent_pcs.len() >= 32 {
+                        recent_pcs.remove(0);
+                    }
+                    recent_pcs.push(pc);
+
                     if steps_since_stream >= stream_interval_steps {
                         stream_new_events(
                             &mut machine,
@@ -150,17 +327,21 @@ pub fn run() -> Result<(), String> {
                             &mut serial_lines,
                             &mut clocks,
                             &mut pacer,
-                            &mut st7789,
-                            &mut gpio_log_limiter,
+                            &mut peripherals,
+                            &mut uart_terminals,
+                            active_uart_filters.as_deref(),
                             &mut display_gui,
                         );
                         steps_since_stream = 0;
                     }
-                    let extra_systick_ticks = pacer.on_step();
+                    let extra_systick_ticks = pacer.on_steps(ran);
                     if extra_systick_ticks > 0 {
                         machine.advance_systick_ticks(extra_systick_ticks);
                     }
                     if steps >= next_heartbeat_step {
+                        for p in &mut peripherals {
+                            p.update(&machine);
+                        }
                         info!(
                             "cpu.heartbeat steps={} pc=0x{:08x}",
                             steps,
@@ -176,7 +357,10 @@ pub fn run() -> Result<(), String> {
             }
         }
 
-        if steps_since_stream > 0 {
+        if steps_since_stream > 0
+            || !machine.serial_output().is_empty()
+            || !machine.mmio_writes().is_empty()
+        {
             stream_new_events(
                 &mut machine,
                 &mut serial_cursor,
@@ -184,24 +368,23 @@ pub fn run() -> Result<(), String> {
                 &mut serial_lines,
                 &mut clocks,
                 &mut pacer,
-                &mut st7789,
-                &mut gpio_log_limiter,
+                &mut peripherals,
+                &mut uart_terminals,
+                active_uart_filters.as_deref(),
                 &mut display_gui,
             );
+
         }
 
-        flush_partial_serial_lines(&serial_lines);
-
-        info!("cpu.steps = {}", steps);
-        info!("cpu.pc.final = 0x{:08x}", machine.cpu().program_counter());
-        if let Some(err) = last_error {
-            info!("cpu.step = {err}");
+        if uart_terminals.is_empty() {
+            flush_partial_serial_lines(&serial_lines);
+        }
+        if let Some(ref err) = last_error {
+            eprintln!("cpu.step = error: {err}");
         } else {
+            info!("cpu.steps = {steps}");
+            info!("cpu.pc.final = 0x{:08x}", machine.cpu().program_counter());
             info!("cpu.step = ok");
-        }
-
-        if let Some(summary) = summarize_clock_writes(machine.mmio_writes()) {
-            info!("{summary}");
         }
         let recent = recent_pcs
             .iter()
@@ -214,117 +397,101 @@ pub fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn stream_new_events(
-    machine: &mut Machine<CortexM3>,
+fn step_cpu_resilient<C: CpuCore>(
+    machine: &mut Machine<C>,
+    preferred_batch: usize,
+) -> Result<u32, String> {
+    let mut last_err: Option<String> = None;
+    for batch in [preferred_batch, 10_000, 1_000, 100, 10, 1] {
+        match machine.step_cpu(batch) {
+            Ok(ran) => return Ok(ran),
+            Err(err) => {
+                // Retry MAP failures with smaller batches; keep other errors as-is.
+                if !err.contains(": MAP") && !err.contains(" MAP") {
+                    return Err(err);
+                }
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "cpu.step failed".to_string()))
+}
+
+fn stream_new_events<C: CpuCore>(
+    machine: &mut Machine<C>,
     serial_cursor: &mut usize,
     mmio_cursor: &mut usize,
     serial_lines: &mut BTreeMap<String, Vec<u8>>,
     clocks: &mut RccClockModel,
     pacer: &mut RealtimePacer,
-    st7789: &mut St7789Capture,
-    gpio_log_limiter: &mut GpioLogLimiter,
+    peripherals: &mut [Box<dyn Peripheral>],
+    uart_terminals: &mut [UartTerminalConsole],
+    active_uart_filters: Option<&[String]>,
     display_gui: &mut Option<DisplayWindow>,
 ) {
+    let has_uart_terminals = !uart_terminals.is_empty();
     let serial_events = machine.serial_output();
     for event in &serial_events[*serial_cursor..] {
-        let line = serial_lines.entry(event.peripheral.clone()).or_default();
-        line.push(event.byte);
-        if event.byte == b'\n' {
-            let text = String::from_utf8_lossy(line);
-            info!("serial.{} = {:?}", event.peripheral, text);
-            line.clear();
+        if let Some(filters) = active_uart_filters
+            && !filters.iter().any(|x| x.eq_ignore_ascii_case(&event.peripheral))
+        {
+            continue;
+        }
+        if has_uart_terminals {
+            for term in uart_terminals.iter_mut() {
+                if term.matches_peripheral(&event.peripheral) {
+                    term.write_tx_byte(event.byte);
+                }
+            }
+        } else {
+            let line = serial_lines.entry(event.peripheral.clone()).or_default();
+            line.push(event.byte);
+            if event.byte == b'\n' {
+                let text = String::from_utf8_lossy(line);
+                println!("serial.{} = {:?}", event.peripheral, text);
+                line.clear();
+            }
         }
     }
     *serial_cursor = serial_events.len();
 
     let mmio_events = machine.mmio_writes();
     for event in &mmio_events[*mmio_cursor..] {
-        if ENABLE_ST7789_CAPTURE {
-            if let Some(path) = st7789.apply_mmio(event) {
-                debug!("display.st7789.frame = {}", path);
-            }
+        if event.peripheral.starts_with("GPIO") && !has_uart_terminals {
+            println!("{}", format_gpio_event(event));
         }
-        if is_usart_data_write(event) {
-            debug!(
-                "mmio.{}.{} @ 0x{:08x} <= 0x{:08x} ({}-bit)",
-                event.peripheral,
-                event.register,
-                event.addr,
-                event.value,
-                event.width as u32 * 8
-            );
-        } else if event.peripheral.starts_with("GPIO")
-            && gpio_log_limiter.should_log(&event.peripheral, &event.register)
+        // info!("mmio_event: {} . {}", event.peripheral, event.register);
+        // Dispatch to peripherals
+        for p in peripherals.iter_mut() {
+            p.on_mmio_write(machine, event);
+        }
+
+        if event.peripheral.starts_with("RCC")
+            && let Some(new_core_hz) = clocks.apply_mmio(event)
         {
-            if event.register.eq_ignore_ascii_case("ODR") {
-                debug!(
-                    "mmio.{}.{} @ 0x{:08x} <= 0x{:08x} ({}-bit)",
-                    event.peripheral,
-                    event.register,
-                    event.addr,
-                    event.value,
-                    event.width as u32 * 8
-                );
-            } else {
-                info!(
-                    "mmio.{}.{} @ 0x{:08x} <= 0x{:08x} ({}-bit)",
-                    event.peripheral,
-                    event.register,
-                    event.addr,
-                    event.value,
-                    event.width as u32 * 8
-                );
-            }
-        } else {
-            debug!(
-                "mmio.{}.{} @ 0x{:08x} <= 0x{:08x} ({}-bit)",
-                event.peripheral,
-                event.register,
-                event.addr,
-                event.value,
-                event.width as u32 * 8
-            );
-        }
-        if let Some(new_core_hz) = clocks.apply_mmio(event) {
             pacer.set_core_clock_hz(new_core_hz);
-            info!(
-                "clock.core.dynamic = {} Hz (RCC SW={}, PLLSRC={}, PLLMUL=x{}, HPRE=/{}; CR=0x{:08x} CFGR=0x{:08x})",
-                new_core_hz,
-                clocks.sw_source_name(),
-                clocks.pll_source_name(),
-                clocks.pll_mul_factor(),
-                clocks.ahb_prescaler(),
-                clocks.cr,
-                clocks.cfgr
-            );
-        }
-        let is_systick_reload = (event.peripheral == "SYST" && event.register == "RVR")
-            || (event.peripheral == "STK" && event.register.contains("LOAD"));
-        if is_systick_reload {
-            info!(
-                "clock.systick.reload = {} cycles (wrap every {} ticks)",
-                event.value & 0x00FF_FFFF,
-                (event.value & 0x00FF_FFFF) + 1
-            );
         }
     }
     *mmio_cursor = mmio_events.len();
 
-    if ENABLE_ST7789_CAPTURE {
-        if let Some((width, height, pixels)) = st7789.take_latest_frame_argb() {
-            if let Some(window) = display_gui.as_mut() {
-                if let Err(err) = window.present(width, height, &pixels) {
-                    info!("display.gui = disabled ({err})");
-                    *display_gui = None;
-                }
+    if let Some(window) = display_gui.as_mut() {
+        for p in peripherals.iter_mut() {
+            if let Some(st) = p.as_any_mut().downcast_mut::<St7789>()
+                && let Some(frame) = st.latest_frame()
+            {
+                let _ = window.present(window.width as u16, window.height as u16, &frame);
             }
         }
 
-        if let Some(window) = display_gui.as_mut()
-            && !window.tick()
-        {
+        if !window.tick() {
             info!("display.gui = closed");
             *display_gui = None;
+        }
+    }
+    for term in uart_terminals.iter_mut() {
+        let rx_bytes = term.read_rx_bytes();
+        for byte in rx_bytes {
+            let _ = machine.usart_push_rx_byte(term.peripheral_name(), byte);
         }
     }
 
@@ -333,39 +500,57 @@ fn stream_new_events(
     *mmio_cursor = 0;
 }
 
+fn format_gpio_event(event: &MmioWriteEvent) -> String {
+    let base = format!(
+        "gpio.{}.{} @ 0x{:08x} <= 0x{:08x}",
+        event.peripheral, event.register, event.addr, event.value
+    );
+    let Some(port) = gpio_port_letter(&event.peripheral) else {
+        return base;
+    };
+    if event.register.eq_ignore_ascii_case("BSRR") {
+        let set_mask = event.value & 0xFFFF;
+        let rst_mask = (event.value >> 16) & 0xFFFF;
+        let set_pins = mask_to_gpio_pins(port, set_mask);
+        let rst_pins = mask_to_gpio_pins(port, rst_mask);
+        return format!(
+            "{base} (set: [{}], reset: [{}])",
+            set_pins.join(", "),
+            rst_pins.join(", ")
+        );
+    }
+    if event.register.eq_ignore_ascii_case("ODR") {
+        let high = mask_to_gpio_pins(port, event.value & 0xFFFF);
+        return format!("{base} (high: [{}])", high.join(", "));
+    }
+    base
+}
+
+fn gpio_port_letter(name: &str) -> Option<char> {
+    if !name.starts_with("GPIO") {
+        return None;
+    }
+    name.chars().nth(4)
+}
+
+fn mask_to_gpio_pins(port: char, mask: u32) -> Vec<String> {
+    let mut pins = Vec::new();
+    for bit in 0..16 {
+        if (mask & (1u32 << bit)) != 0 {
+            pins.push(format!("P{port}{bit}"));
+        }
+    }
+    pins
+}
+
 fn flush_partial_serial_lines(serial_lines: &BTreeMap<String, Vec<u8>>) {
     for (peripheral, bytes) in serial_lines {
         if bytes.is_empty() {
             continue;
         }
         let text = String::from_utf8_lossy(bytes);
-        info!("serial.{peripheral} = {:?} (partial)", text);
+        println!("serial.{peripheral} = {:?} (partial)", text);
     }
-}
-
-fn summarize_clock_writes(events: &[MmioWriteEvent]) -> Option<String> {
-    let mut apb2enr = None;
-    let mut cfgr = None;
-    for event in events {
-        if event.peripheral == "RCC" && event.register == "APB2ENR" {
-            apb2enr = Some(event.value);
-        }
-        if event.peripheral == "RCC" && event.register == "CFGR" {
-            cfgr = Some(event.value);
-        }
-    }
-    if apb2enr.is_none() && cfgr.is_none() {
-        return None;
-    }
-    let apb2_bits = apb2enr
-        .map(|v| format!("0x{v:08x}"))
-        .unwrap_or_else(|| "n/a".to_string());
-    let cfgr_bits = cfgr
-        .map(|v| format!("0x{v:08x}"))
-        .unwrap_or_else(|| "n/a".to_string());
-    Some(format!(
-        "clock.rcc.summary = CFGR={cfgr_bits}, APB2ENR={apb2_bits}"
-    ))
 }
 
 struct DisplayWindow {
@@ -415,9 +600,6 @@ impl DisplayWindow {
         self.front_buffer.clear();
         self.front_buffer.extend_from_slice(pixels);
         self.presents = self.presents.saturating_add(1);
-        if self.presents <= 3 || self.presents.is_multiple_of(30) {
-            debug!("display.gui.present #{} ({}x{})", self.presents, width, height);
-        }
         self.window
             .update_with_buffer(&self.front_buffer, self.width, self.height)
             .map_err(|e| format!("update window failed: {e}"))
@@ -435,30 +617,82 @@ impl DisplayWindow {
     }
 }
 
-struct GpioLogLimiter {
-    interval: Duration,
-    last_log: BTreeMap<(String, String), Instant>,
+struct UartTerminalConsole {
+    peripheral: String,
+    stdin_rx: Option<Receiver<u8>>,
+    show_prefix: bool,
+    at_line_start: bool,
 }
 
-impl GpioLogLimiter {
-    fn new(interval: Duration) -> Self {
-        Self {
-            interval,
-            last_log: BTreeMap::new(),
+impl UartTerminalConsole {
+    fn new(
+        peripheral: &str,
+        stdin_rx: Option<Receiver<u8>>,
+        show_prefix: bool,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            peripheral: peripheral.to_string(),
+            stdin_rx,
+            show_prefix,
+            at_line_start: true,
+        })
+    }
+
+    fn peripheral_name(&self) -> &str {
+        &self.peripheral
+    }
+
+    fn matches_peripheral(&self, peripheral: &str) -> bool {
+        self.peripheral.eq_ignore_ascii_case(peripheral)
+    }
+
+    fn write_tx_byte(&mut self, byte: u8) {
+        let mut out = std::io::stdout();
+        if self.show_prefix && self.at_line_start {
+            let _ = write!(out, "[{}] ", self.peripheral);
+        }
+        let _ = out.write_all(&[byte]);
+        self.at_line_start = byte == b'\n';
+        if byte == b'\n' {
+            let _ = out.flush();
         }
     }
 
-    fn should_log(&mut self, peripheral: &str, register: &str) -> bool {
-        let now = Instant::now();
-        let key = (peripheral.to_string(), register.to_string());
-        match self.last_log.get(&key) {
-            Some(last) if now.duration_since(*last) < self.interval => false,
-            _ => {
-                self.last_log.insert(key, now);
-                true
+    fn read_rx_bytes(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let Some(rx) = self.stdin_rx.as_ref() else {
+            return out;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(byte) => out.push(byte),
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
         }
+        out
     }
+}
+
+fn spawn_stdin_reader() -> Receiver<u8> {
+    let (tx, rx) = mpsc::channel::<u8>();
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut lock = stdin.lock();
+        let mut buf = [0u8; 1];
+        loop {
+            match lock.read(&mut buf) {
+                Ok(0) => break,
+                Ok(1) => {
+                    if tx.send(buf[0]).is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    rx
 }
 
 struct RealtimePacer {
@@ -508,16 +742,16 @@ impl RealtimePacer {
         };
     }
 
-    fn on_step(&mut self) -> u64 {
+    fn on_steps(&mut self, n: u32) -> u64 {
         if !self.enabled {
             return 0;
         }
-        self.step_count = self.step_count.saturating_add(1);
+        self.step_count = self.step_count.saturating_add(n as u64);
         if let Some(nanos_per_step) = self.nanos_per_step {
             self.expected_elapsed_nanos =
-                self.expected_elapsed_nanos.saturating_add(nanos_per_step);
+                self.expected_elapsed_nanos.saturating_add(nanos_per_step * n as u128);
         }
-        if self.step_count % self.checkpoint_interval != 0 {
+        if self.step_count % self.checkpoint_interval >= n as u64 {
             return 0;
         }
         if self.nanos_per_step.is_none() {
@@ -635,7 +869,7 @@ impl RccClockModel {
         }
     }
 
-    fn sw_source_name(&self) -> &'static str {
+    fn _sw_source_name(&self) -> &'static str {
         match self.cfgr & 0x3 {
             0b00 => "HSI",
             0b01 => "HSE",
@@ -644,7 +878,7 @@ impl RccClockModel {
         }
     }
 
-    fn pll_source_name(&self) -> &'static str {
+    fn _pll_source_name(&self) -> &'static str {
         if (self.cfgr >> 16) & 0x1 == 0 {
             "HSI/2"
         } else if (self.cfgr >> 17) & 0x1 == 0 {
@@ -653,14 +887,6 @@ impl RccClockModel {
             "HSE/2"
         }
     }
-}
-
-fn is_usart_data_write(event: &MmioWriteEvent) -> bool {
-    event.peripheral.starts_with("USART") && event.register.to_ascii_uppercase().starts_with("DR")
-}
-
-fn is_spi_data_write(event: &MmioWriteEvent) -> bool {
-    event.peripheral.starts_with("SPI") && event.register.to_ascii_uppercase().starts_with("DR")
 }
 
 fn merge_mmio_write(current: u32, event: &MmioWriteEvent) -> u32 {
@@ -678,530 +904,5 @@ fn merge_mmio_write(current: u32, event: &MmioWriteEvent) -> u32 {
             (current & mask) | ((event.value & 0xFFFF) << shift)
         }
         _ => event.value,
-    }
-}
-
-#[derive(Debug)]
-struct St7789Capture {
-    width: u16,
-    height: u16,
-    framebuffer: Vec<u16>,
-    output_dir: String,
-    dump_frames: bool,
-    frame_id: u32,
-    gpio_odr: BTreeMap<String, u32>,
-    current_cmd: Option<u8>,
-    params: Vec<u8>,
-    window_x0: u16,
-    window_x1: u16,
-    window_y0: u16,
-    window_y1: u16,
-    cursor_x: u16,
-    cursor_y: u16,
-    pixel_hi: Option<u8>,
-    active_spi_addr: Option<u64>,
-    sample_count: u64,
-    event_index: u64,
-    recent_spi_event_index: Option<u64>,
-    wiring: Option<St7789Wiring>,
-    pin_stats: BTreeMap<(String, u8), PinStats>,
-    pending_falling: BTreeMap<(String, u8), u64>,
-    latest_frame_argb: Option<Vec<u32>>,
-    preview_argb: Vec<u32>,
-    preview_enabled: bool,
-    ramwr_pixels_written: u32,
-    preview_every_pixels: u32,
-    preview_log_every_pixels: u32,
-    frame_log_every: u32,
-    ramwr_dropped_bytes: u64,
-    spi_bytes_seen: u64,
-    command_count: u64,
-    ignored_data_bytes: u64,
-    non_black_pixels: u32,
-}
-
-impl St7789Capture {
-    fn new(width: u16, height: u16, output_dir: &str, dump_frames: bool, preview_enabled: bool) -> Self {
-        if dump_frames {
-            let _ = fs::create_dir_all(output_dir);
-        }
-        Self {
-            width,
-            height,
-            framebuffer: vec![0; usize::from(width) * usize::from(height)],
-            output_dir: output_dir.to_string(),
-            dump_frames,
-            frame_id: 0,
-            gpio_odr: BTreeMap::new(),
-            current_cmd: None,
-            params: Vec::new(),
-            window_x0: 0,
-            window_x1: width.saturating_sub(1),
-            window_y0: 0,
-            window_y1: height.saturating_sub(1),
-            cursor_x: 0,
-            cursor_y: 0,
-            pixel_hi: None,
-            active_spi_addr: None,
-            sample_count: 0,
-            event_index: 0,
-            recent_spi_event_index: None,
-            wiring: None,
-            pin_stats: BTreeMap::new(),
-            pending_falling: BTreeMap::new(),
-            latest_frame_argb: None,
-            preview_argb: if preview_enabled {
-                vec![0; usize::from(width) * usize::from(height)]
-            } else {
-                Vec::new()
-            },
-            preview_enabled,
-            ramwr_pixels_written: 0,
-            preview_every_pixels: 1024,
-            preview_log_every_pixels: 65536,
-            frame_log_every: 4,
-            ramwr_dropped_bytes: 0,
-            spi_bytes_seen: 0,
-            command_count: 0,
-            ignored_data_bytes: 0,
-            non_black_pixels: 0,
-        }
-    }
-
-    fn apply_mmio(&mut self, event: &MmioWriteEvent) -> Option<String> {
-        self.event_index = self.event_index.saturating_add(1);
-        if event.peripheral.starts_with("GPIO") && event.register.eq_ignore_ascii_case("ODR") {
-            return self.on_gpio_write(event);
-        }
-        if !is_spi_data_write(event) {
-            return None;
-        }
-        let spi_addr = event.addr;
-        let byte = (event.value & 0xFF) as u8;
-        if self.active_spi_addr.is_none() {
-            self.active_spi_addr = Some(spi_addr);
-            info!("display.st7789.spi_candidate = 0x{spi_addr:08x}");
-        }
-        if self.active_spi_addr != Some(spi_addr) {
-            return None;
-        }
-
-        if self.wiring.is_none() {
-            self.observe_spi_sample();
-            self.try_detect_wiring();
-            return None;
-        }
-
-        let wiring = self.wiring.as_ref()?;
-        let cs_low = self.gpio_pin(&wiring.cs_port, wiring.cs_pin) == 0;
-        if !cs_low {
-            return None;
-        }
-        let dc_high = self.gpio_pin(&wiring.dc_port, wiring.dc_pin) == 1;
-        self.spi_bytes_seen = self.spi_bytes_seen.saturating_add(1);
-        if dc_high {
-            self.on_data(byte)
-        } else {
-            self.on_command(byte);
-            None
-        }
-    }
-
-    fn on_gpio_write(&mut self, event: &MmioWriteEvent) -> Option<String> {
-        let key = event.peripheral.clone();
-        let old_odr = self.gpio_odr.get(&key).copied().unwrap_or(0);
-        let new_odr = merge_mmio_write(old_odr, event);
-        self.gpio_odr.insert(key.clone(), new_odr);
-
-        let mut frame = None;
-        for pin in 0..16 {
-            let old = ((old_odr >> pin) & 1) as u8;
-            let new = ((new_odr >> pin) & 1) as u8;
-            if old == new {
-                continue;
-            }
-            let stats = self.pin_stats.entry((key.clone(), pin)).or_default();
-            stats.transitions = stats.transitions.saturating_add(1);
-            if old == 1 && new == 0 {
-                self.pending_falling
-                    .insert((key.clone(), pin), self.event_index);
-            } else if old == 0
-                && new == 1
-                && self
-                    .recent_spi_event_index
-                    .is_some_and(|idx| self.event_index.saturating_sub(idx) <= 8)
-            {
-                stats.rising_after_spi = stats.rising_after_spi.saturating_add(1);
-            }
-            if let Some(wiring) = self.wiring.as_ref()
-                && wiring.cs_port == key
-                && wiring.cs_pin == pin
-                && old == 0
-                && new == 1
-                && self.current_cmd == Some(0x2C)
-            {
-                if self.ramwr_pixels_written > 0 {
-                    frame = self.emit_frame().ok();
-                } else {
-                    debug!("display.st7789.frame.skip = cs-rise before pixel data");
-                }
-            }
-        }
-        frame
-    }
-
-    fn observe_spi_sample(&mut self) {
-        self.sample_count = self.sample_count.saturating_add(1);
-        self.recent_spi_event_index = Some(self.event_index);
-        let ports: Vec<(String, u32)> =
-            self.gpio_odr.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        for (port, odr) in ports {
-            for pin in 0..16 {
-                let value = ((odr >> pin) & 1) as u8;
-                let entry = self.pin_stats.entry((port.clone(), pin)).or_default();
-                if value == 0 {
-                    entry.low_on_spi = entry.low_on_spi.saturating_add(1);
-                } else {
-                    entry.high_on_spi = entry.high_on_spi.saturating_add(1);
-                }
-                if value == 0
-                    && self
-                        .pending_falling
-                        .remove(&(port.clone(), pin))
-                        .is_some_and(|idx| self.event_index.saturating_sub(idx) <= 8)
-                {
-                    entry.falling_before_spi = entry.falling_before_spi.saturating_add(1);
-                }
-            }
-        }
-    }
-
-    fn try_detect_wiring(&mut self) {
-        if self.wiring.is_some() || self.sample_count < 8 {
-            return;
-        }
-
-        let mut cs_candidate: Option<((String, u8), u64)> = None;
-        for (pin, stats) in &self.pin_stats {
-            let total = stats.low_on_spi + stats.high_on_spi;
-            if total < 12 || stats.low_on_spi <= stats.high_on_spi || stats.falling_before_spi == 0
-            {
-                continue;
-            }
-            let score = stats.low_on_spi * 5
-                + stats.falling_before_spi * 12
-                + stats.rising_after_spi * 10
-                + stats.transitions;
-            if cs_candidate.as_ref().is_none_or(|(_, best)| score > *best) {
-                cs_candidate = Some((pin.clone(), score));
-            }
-        }
-        let Some((cs_pin, _)) = cs_candidate else {
-            return;
-        };
-
-        let mut dc_candidate: Option<((String, u8), u64)> = None;
-        for (pin, stats) in &self.pin_stats {
-            if *pin == cs_pin {
-                continue;
-            }
-            let total = stats.low_on_spi + stats.high_on_spi;
-            if total < 12
-                || stats.low_on_spi == 0
-                || stats.high_on_spi == 0
-                || stats.transitions < 2
-            {
-                continue;
-            }
-            let balance = stats.low_on_spi.min(stats.high_on_spi);
-            let score = stats.transitions * 8 + balance + stats.rising_after_spi;
-            if dc_candidate.as_ref().is_none_or(|(_, best)| score > *best) {
-                dc_candidate = Some((pin.clone(), score));
-            }
-        }
-        let Some((dc_pin, _)) = dc_candidate else {
-            return;
-        };
-
-        let Some(spi_addr) = self.active_spi_addr else {
-            return;
-        };
-        self.wiring = Some(St7789Wiring {
-            spi: format!("0x{spi_addr:08x}"),
-            cs_port: cs_pin.0,
-            cs_pin: cs_pin.1,
-            dc_port: dc_pin.0,
-            dc_pin: dc_pin.1,
-        });
-        self.current_cmd = None;
-        self.params.clear();
-        self.pixel_hi = None;
-        self.ramwr_pixels_written = 0;
-        if let Some(wiring) = &self.wiring {
-            info!(
-                "display.st7789.wiring = spi={}, cs={}.{}, dc={}.{}",
-                wiring.spi, wiring.cs_port, wiring.cs_pin, wiring.dc_port, wiring.dc_pin
-            );
-        }
-    }
-
-    fn gpio_pin(&self, peripheral: &str, pin: u8) -> u8 {
-        let odr = self.gpio_odr.get(peripheral).copied().unwrap_or(0);
-        ((odr >> pin) & 1) as u8
-    }
-
-    fn on_command(&mut self, cmd: u8) {
-        self.current_cmd = Some(cmd);
-        self.params.clear();
-        self.pixel_hi = None;
-        self.command_count = self.command_count.saturating_add(1);
-        if matches!(cmd, 0x2A | 0x2B | 0x2C) {
-            info!(
-                "display.st7789.cmd = 0x{cmd:02x} (spi_bytes={}, cmd_count={})",
-                self.spi_bytes_seen, self.command_count
-            );
-        } else if self.command_count <= 16 || self.command_count.is_multiple_of(128) {
-            debug!(
-                "display.st7789.cmd.raw = 0x{cmd:02x} (cmd_count={})",
-                self.command_count
-            );
-        }
-        if cmd == 0x2C {
-            self.cursor_x = self.window_x0;
-            self.cursor_y = self.window_y0;
-            self.ramwr_pixels_written = 0;
-        }
-    }
-
-    fn on_data(&mut self, byte: u8) -> Option<String> {
-        match self.current_cmd {
-            Some(0x2A) => {
-                self.params.push(byte);
-                if self.params.len() == 4 {
-                    self.window_x0 = u16::from_be_bytes([self.params[0], self.params[1]]);
-                    self.window_x1 = u16::from_be_bytes([self.params[2], self.params[3]]);
-                    info!(
-                        "display.st7789.window.x = {}..{}",
-                        self.window_x0, self.window_x1
-                    );
-                }
-                None
-            }
-            Some(0x2B) => {
-                self.params.push(byte);
-                if self.params.len() == 4 {
-                    self.window_y0 = u16::from_be_bytes([self.params[0], self.params[1]]);
-                    self.window_y1 = u16::from_be_bytes([self.params[2], self.params[3]]);
-                    info!(
-                        "display.st7789.window.y = {}..{}",
-                        self.window_y0, self.window_y1
-                    );
-                }
-                None
-            }
-            Some(0x2C) => self.on_ramwr_data(byte),
-            _ => {
-                self.ignored_data_bytes = self.ignored_data_bytes.saturating_add(1);
-                if self.ignored_data_bytes <= 8 || self.ignored_data_bytes.is_multiple_of(512) {
-                    debug!(
-                        "display.st7789.data.ignored byte=0x{byte:02x} cmd={:?} ignored={}",
-                        self.current_cmd, self.ignored_data_bytes
-                    );
-                }
-                None
-            }
-        }
-    }
-
-    fn on_ramwr_data(&mut self, byte: u8) -> Option<String> {
-        let window_w = u32::from(self.window_x1.saturating_sub(self.window_x0).saturating_add(1));
-        let window_h = u32::from(self.window_y1.saturating_sub(self.window_y0).saturating_add(1));
-        let window_pixels = window_w.saturating_mul(window_h);
-        if window_pixels > 0 && self.ramwr_pixels_written >= window_pixels {
-            self.ramwr_dropped_bytes = self.ramwr_dropped_bytes.saturating_add(1);
-            if self.ramwr_dropped_bytes == 1 || self.ramwr_dropped_bytes.is_multiple_of(65_536) {
-                warn!(
-                    "display.st7789.ramwr.overflow window={}x{} pixels={} dropping_extra_bytes={}",
-                    window_w, window_h, window_pixels, self.ramwr_dropped_bytes
-                );
-            }
-            self.pixel_hi = None;
-            return None;
-        }
-
-        if self.pixel_hi.is_none() {
-            self.pixel_hi = Some(byte);
-            return None;
-        }
-
-        let hi = self.pixel_hi.take().unwrap_or(0);
-        let pixel = u16::from_be_bytes([hi, byte]);
-        let x = self.cursor_x.min(self.width.saturating_sub(1));
-        let y = self.cursor_y.min(self.height.saturating_sub(1));
-        let idx = usize::from(y) * usize::from(self.width) + usize::from(x);
-        if idx < self.framebuffer.len() {
-            let old = self.framebuffer[idx];
-            if old != pixel {
-                self.framebuffer[idx] = pixel;
-                if old == 0 && pixel != 0 {
-                    self.non_black_pixels = self.non_black_pixels.saturating_add(1);
-                }
-                if self.preview_enabled {
-                    self.preview_argb[idx] = if pixel == 0 {
-                        0
-                    } else {
-                        let rgb = rgb565_to_rgb888(pixel);
-                        ((u32::from(rgb[0])) << 16) | ((u32::from(rgb[1])) << 8) | u32::from(rgb[2])
-                    };
-                }
-            }
-        }
-        self.ramwr_pixels_written = self.ramwr_pixels_written.saturating_add(1);
-        if self.ramwr_pixels_written <= 4 || self.ramwr_pixels_written.is_multiple_of(4096) {
-            debug!(
-                "display.st7789.ramwr.pixel_count = {}",
-                self.ramwr_pixels_written
-            );
-        }
-        if self.preview_enabled
-            && self
-                .ramwr_pixels_written
-                .is_multiple_of(self.preview_every_pixels)
-        {
-            self.latest_frame_argb = Some(self.preview_argb.clone());
-            if self
-                .ramwr_pixels_written
-                .is_multiple_of(self.preview_log_every_pixels)
-            {
-                info!(
-                    "display.st7789.preview pixels={} non_black={}",
-                    self.ramwr_pixels_written, self.non_black_pixels
-                );
-            }
-        }
-
-        if self.cursor_x < self.window_x1 {
-            self.cursor_x = self.cursor_x.saturating_add(1);
-            return None;
-        }
-        self.cursor_x = self.window_x0;
-        if self.cursor_y < self.window_y1 {
-            self.cursor_y = self.cursor_y.saturating_add(1);
-            return None;
-        }
-        self.cursor_y = self.window_y0;
-        self.emit_frame().ok()
-    }
-
-    fn emit_frame(&mut self) -> Result<String, String> {
-        let frame_seq = self.frame_id;
-        self.frame_id = self.frame_id.wrapping_add(1);
-        if self.preview_enabled {
-            self.latest_frame_argb = Some(self.preview_argb.clone());
-        }
-
-        let path = format!("{}/frame_{:06}.ppm", self.output_dir, frame_seq);
-        if self.dump_frames {
-            let mut file = File::create(&path).map_err(|e| format!("create ppm failed: {e}"))?;
-            let header = format!("P6\n{} {}\n255\n", self.width, self.height);
-            file.write_all(header.as_bytes())
-                .map_err(|e| format!("write ppm header failed: {e}"))?;
-            for pixel in &self.framebuffer {
-                let rgb = rgb565_to_rgb888(*pixel);
-                file.write_all(&rgb)
-                    .map_err(|e| format!("write ppm pixel failed: {e}"))?;
-            }
-        }
-        if self.non_black_pixels == 0 {
-            warn!(
-                "display.st7789.frame.black frame={} pixels={} (likely missing RAMWR data)",
-                frame_seq, self.ramwr_pixels_written
-            );
-        } else if frame_seq.is_multiple_of(self.frame_log_every) {
-            info!(
-                "display.st7789.frame.stats frame={} pixels={} non_black={}",
-                frame_seq, self.ramwr_pixels_written, self.non_black_pixels
-            );
-        } else {
-            debug!(
-                "display.st7789.frame.stats frame={} pixels={} non_black={}",
-                frame_seq, self.ramwr_pixels_written, self.non_black_pixels
-            );
-        }
-        if self.dump_frames {
-            Ok(path)
-        } else {
-            Ok(format!("frame_{frame_seq:06}"))
-        }
-    }
-
-    fn take_latest_frame_argb(&mut self) -> Option<(u16, u16, Vec<u32>)> {
-        self.latest_frame_argb
-            .take()
-            .map(|pixels| (self.width, self.height, pixels))
-    }
-
-}
-
-#[derive(Debug, Clone)]
-struct St7789Wiring {
-    spi: String,
-    cs_port: String,
-    cs_pin: u8,
-    dc_port: String,
-    dc_pin: u8,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct PinStats {
-    low_on_spi: u64,
-    high_on_spi: u64,
-    transitions: u64,
-    falling_before_spi: u64,
-    rising_after_spi: u64,
-}
-
-fn rgb565_to_rgb888(pixel: u16) -> [u8; 3] {
-    let r5 = ((pixel >> 11) & 0x1F) as u8;
-    let g6 = ((pixel >> 5) & 0x3F) as u8;
-    let b5 = (pixel & 0x1F) as u8;
-    let r8 = (r5 << 3) | (r5 >> 2);
-    let g8 = (g6 << 2) | (g6 >> 4);
-    let b8 = (b5 << 3) | (b5 >> 2);
-    [r8, g8, b8]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::RccClockModel;
-    use rsemu_core::MmioWriteEvent;
-
-    fn mmio(peripheral: &str, register: &str, addr: u64, width: u8, value: u32) -> MmioWriteEvent {
-        MmioWriteEvent {
-            peripheral: peripheral.to_string(),
-            register: register.to_string(),
-            addr,
-            width,
-            value,
-        }
-    }
-
-    #[test]
-    fn rcc_cfgr_full_write_updates_core_clock() {
-        let mut model = RccClockModel::new(8_000_000);
-        // SW=PLL(0b10), HPRE=/1(0), PLLSRC=HSE(1), PLLMUL=x9(bits 0b0111).
-        let cfgr = 0x001D_0002u32;
-        let changed = model.apply_mmio(&mmio("RCC", "CFGR", 0x4002_1004, 4, cfgr));
-        assert_eq!(changed, Some(72_000_000));
-    }
-
-    #[test]
-    fn rcc_cfgr_byte_writes_update_core_clock() {
-        let mut model = RccClockModel::new(8_000_000);
-        // byte0: SW=PLL
-        let _ = model.apply_mmio(&mmio("RCC", "CFGR", 0x4002_1004, 1, 0x02));
-        // byte2: PLLSRC=HSE, PLLMUL=x9
-        let changed = model.apply_mmio(&mmio("RCC", "CFGR", 0x4002_1006, 1, 0x1D));
-        assert_eq!(changed, Some(72_000_000));
     }
 }
