@@ -2,10 +2,92 @@ use base64::Engine;
 use rsemu_core::cpu::armv7em::CortexM4;
 use rsemu_core::cpu::armv7m::CortexM3;
 use tauri::Emitter;
+use std::thread;
+use std::time::{Duration, Instant};
 
 // Bundled SVD files — embedded at compile time so the user never needs to supply them.
 const SVD_F103: &str = include_str!("../svd/stm32f103.svd");
 const SVD_F407: &str = include_str!("../svd/stm32f407.svd");
+
+// ── RealtimePacer: slows emulation to real-time clock speed ─────────────────
+
+struct RealtimePacer {
+    start: Instant,
+    expected_elapsed_nanos: u128,
+    nanos_per_step: Option<u128>,
+    step_count: u64,
+    cycles_per_step: u32,
+    checkpoint_interval: u64,
+    enabled: bool,
+}
+
+impl RealtimePacer {
+    fn new(core_clock_hz: u32, cycles_per_step: u32) -> Self {
+        let nanos_per_step = if core_clock_hz == 0 || cycles_per_step == 0 {
+            None
+        } else {
+            Some(
+                (u128::from(cycles_per_step) * 1_000_000_000u128)
+                    .div_ceil(u128::from(core_clock_hz)),
+            )
+        };
+
+        Self {
+            start: Instant::now(),
+            expected_elapsed_nanos: 0,
+            nanos_per_step,
+            step_count: 0,
+            cycles_per_step,
+            checkpoint_interval: 64,
+            enabled: true,
+        }
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// Returns extra SysTick ticks to inject if we're lagging behind real-time.
+    fn on_steps(&mut self, n: u32) -> u64 {
+        if !self.enabled {
+            return 0;
+        }
+        self.step_count = self.step_count.saturating_add(n as u64);
+        if let Some(nanos_per_step) = self.nanos_per_step {
+            self.expected_elapsed_nanos =
+                self.expected_elapsed_nanos.saturating_add(nanos_per_step * n as u128);
+        }
+        if self.step_count % self.checkpoint_interval >= n as u64 {
+            return 0;
+        }
+        if self.nanos_per_step.is_none() {
+            return 0;
+        }
+        let expected = self.expected_elapsed_nanos;
+        let elapsed = self.start.elapsed().as_nanos();
+        if expected <= elapsed {
+            // We're lagging: inject extra SysTick ticks to catch up
+            let nanos_per_step = self.nanos_per_step.unwrap_or(0);
+            if nanos_per_step == 0 {
+                return 0;
+            }
+            let lag = elapsed - expected;
+            let extra_ticks = lag / nanos_per_step;
+            if extra_ticks > 0 {
+                let gained = extra_ticks.saturating_mul(nanos_per_step);
+                self.expected_elapsed_nanos = self.expected_elapsed_nanos.saturating_add(gained);
+                return u64::try_from(extra_ticks).unwrap_or(u64::MAX);
+            }
+            return 0;
+        }
+        // We're ahead: sleep to slow down to real-time
+        let remaining = expected - elapsed;
+        let sleep_nanos = remaining.min(Duration::MAX.as_nanos());
+        let sleep_nanos_u64 = u64::try_from(sleep_nanos).unwrap_or(u64::MAX);
+        thread::sleep(Duration::from_nanos(sleep_nanos_u64));
+        0
+    }
+}
 use rsemu_core::{CpuCore, FirmwareLoader, Machine, MmioWriteEvent};
 use rsemu_peripherals::display::St7789;
 use rsemu_peripherals::Peripheral;
@@ -104,15 +186,26 @@ fn gpio_idr_addr(port: char, is_f407: bool) -> u64 {
 // ── Public entry point ───────────────────────────────────────────────────────
 
 pub fn run_emulator(config: SimConfig, app: AppHandle, control_rx: Receiver<ControlMsg>) {
+    eprintln!("[EMU] Starting emulator for board: {}", config.board);
+    eprintln!("[EMU] Firmware: {}", config.firmware_path);
+    eprintln!("[EMU] Peripherals: {} items", config.peripherals.len());
+    for (i, p) in config.peripherals.iter().enumerate() {
+        eprintln!("[EMU]   [{}] {:?}", i, p);
+    }
+
     let is_f407 = config.board == "stm32f407";
     let target = match if is_f407 {
         f407::load_target(Some(SVD_F407))
     } else {
         f103::load_target(Some(SVD_F103))
     } {
-        Ok(t) => t,
+        Ok(t) => {
+            eprintln!("[EMU] Target loaded: {} ({} peripherals)", t.name, t.peripherals.len());
+            t
+        }
         Err(e) => {
-            app.emit("sim-status", SimStatusPayload { steps: 0, running: false, error: Some(e) }).ok();
+            eprintln!("[EMU] ERROR loading target: {}", e);
+            app.emit("sim-status", SimStatusPayload { steps: 0, running: false, error: Some(e.clone()) }).ok();
             return;
         }
     };
@@ -134,24 +227,41 @@ fn run_machine<C: CpuCore>(
     control_rx: Receiver<ControlMsg>,
     is_f407: bool,
 ) {
+    // Extract values needed for pacer before moving target into Machine
+    let core_clock_hz = target.core_clock_hz;
+    let systick_reload_divider = target.systick_reload_divider;
+
     let mut machine = Machine::new(cpu, target);
 
     // Load firmware
+    eprintln!("[EMU] Loading firmware from: {}", config.firmware_path);
     let fw = match FirmwareLoader::load_file(&config.firmware_path, 0x0800_0000) {
-        Ok(fw) => fw,
+        Ok(fw) => {
+            eprintln!("[EMU] Firmware loaded: {} segments", fw.segments().len());
+            for (i, seg) in fw.segments().iter().enumerate() {
+                eprintln!("[EMU]   Segment {}: 0x{:08x} ({} bytes)", i, seg.load_address, seg.bytes.len());
+            }
+            fw
+        }
         Err(e) => {
-            app.emit("sim-status", SimStatusPayload { steps: 0, running: false, error: Some(e) }).ok();
+            eprintln!("[EMU] ERROR loading firmware: {}", e);
+            app.emit("sim-status", SimStatusPayload { steps: 0, running: false, error: Some(e.clone()) }).ok();
             return;
         }
     };
     if let Err(e) = machine.load_firmware(&fw) {
-        app.emit("sim-status", SimStatusPayload { steps: 0, running: false, error: Some(e) }).ok();
+        eprintln!("[EMU] ERROR loading firmware into memory: {}", e);
+        app.emit("sim-status", SimStatusPayload { steps: 0, running: false, error: Some(e.clone()) }).ok();
         return;
     }
+    eprintln!("[EMU] Firmware loaded into machine memory");
+
     if let Err(e) = machine.reset_cpu() {
-        app.emit("sim-status", SimStatusPayload { steps: 0, running: false, error: Some(e) }).ok();
+        eprintln!("[EMU] ERROR resetting CPU: {}", e);
+        app.emit("sim-status", SimStatusPayload { steps: 0, running: false, error: Some(e.clone()) }).ok();
         return;
     }
+    eprintln!("[EMU] CPU reset complete. Initial PC: 0x{:08x}", machine.cpu().program_counter());
 
     // Build peripheral list and LED trackers
     let mut peripherals: Vec<Box<dyn Peripheral>> = Vec::new();
@@ -159,19 +269,23 @@ fn run_machine<C: CpuCore>(
     let mut uart_peripherals: Vec<String> = Vec::new();
     let mut display_size: Option<(u16, u16)> = None;
 
-    for pc in &config.peripherals {
+    eprintln!("[EMU] Initializing peripherals...");
+    for (idx, pc) in config.peripherals.iter().enumerate() {
         match pc {
             GuiPeripheralConfig::St7789 { width, height, spi_base, cs, dc, res } => {
+                eprintln!("[EMU]   [{}] ST7789 {}x{} SPI base 0x{:08x}", idx, width, height, spi_base);
+                eprintln!("[EMU]        CS: P{}{}, DC: P{}{}", cs.port, cs.pin, dc.port, dc.pin);
                 peripherals.push(Box::new(St7789::new(
                     *width, *height, *spi_base,
                     cs.clone(), dc.clone(), res.clone(),
-                    String::new(), false, false,
+                    String::new(), false, true, // preview_enabled=true for debugging
                 )));
                 if display_size.is_none() {
                     display_size = Some((*width, *height));
                 }
             }
             GuiPeripheralConfig::Led { id, pin, active_low } => {
+                eprintln!("[EMU]   [{}] LED {} on P{}{} (active_low={})", idx, id, pin.port, pin.pin, active_low);
                 led_trackers.push(LedTracker {
                     id: id.clone(),
                     port: pin.port.clone(),
@@ -182,17 +296,43 @@ fn run_machine<C: CpuCore>(
                 });
             }
             GuiPeripheralConfig::Uart { usart } => {
+                eprintln!("[EMU]   [{}] UART {}", idx, usart);
                 uart_peripherals.push(usart.clone());
             }
-            GuiPeripheralConfig::Button { .. } => {} // input handled via inject_gpio command
+            GuiPeripheralConfig::Button { id, pin } => {
+                eprintln!("[EMU]   [{}] Button {} on P{}{}", idx, id, pin.port, pin.pin);
+            }
         }
     }
+    eprintln!("[EMU] Peripherals initialized: {} total", peripherals.len() + led_trackers.len() + uart_peripherals.len());
+
+    // Initialize real-time pacer to make delays work correctly
+    let base_emu_cycles_per_step = ((u64::from(systick_reload_divider) * 3) / 5).max(1);
+    let emu_cycles_per_step = base_emu_cycles_per_step as u32;
+    let mut pacer = RealtimePacer::new(core_clock_hz, emu_cycles_per_step);
+    pacer.set_enabled(true); // Enable real-time pacing
+    eprintln!("[EMU] RealtimePacer: {} Hz, {} cycles/step", core_clock_hz, emu_cycles_per_step);
 
     app.emit("sim-status", SimStatusPayload { steps: 0, running: true, error: None }).ok();
+    eprintln!("[EMU] === Starting main loop ===");
 
     let mut steps = 0u64;
     let mut serial_cursor = 0usize;
     let mut mmio_cursor = 0usize;
+    let mut last_log_steps = 0u64;
+    let log_interval = 100_000u64;
+
+    // Throttling: process events every N steps to avoid overwhelming the frontend
+    let stream_interval_steps: u64 = 4096;
+    let mut steps_since_stream = 0u64;
+
+    // UART batching: collect bytes and send in batches
+    let mut uart_batch: Vec<(String, u8)> = Vec::new();
+    let uart_batch_size = 64; // Send batch every 64 bytes
+
+    // Display frame throttling: max 10 fps
+    let frame_interval_steps: u64 = 100_000; // ~10 fps at 1M steps/sec
+    let mut steps_since_frame = 0u64;
 
     loop {
         // Drain all pending control messages
@@ -231,7 +371,16 @@ fn run_machine<C: CpuCore>(
         match step_cpu_resilient(&mut machine) {
             Ok(ran) => {
                 steps += ran as u64;
-                if steps % 128 < ran as u64 {
+                steps_since_stream += ran as u64;
+                steps_since_frame += ran as u64;
+
+                // Real-time pacing: sleep or inject extra SysTick ticks
+                let extra_systick_ticks = pacer.on_steps(ran);
+                if extra_systick_ticks > 0 {
+                    machine.advance_systick_ticks(extra_systick_ticks);
+                }
+
+                if steps_since_stream >= stream_interval_steps {
                     process_events(
                         &mut machine,
                         &mut serial_cursor,
@@ -242,11 +391,27 @@ fn run_machine<C: CpuCore>(
                         display_size,
                         &app,
                         steps,
+                        &mut uart_batch,
+                        uart_batch_size,
+                        steps_since_frame >= frame_interval_steps,
                     );
+                    steps_since_stream = 0;
+                    if steps_since_frame >= frame_interval_steps {
+                        steps_since_frame = 0;
+                    }
+                }
+
+                // Periodic logging
+                if steps - last_log_steps >= log_interval {
+                    eprintln!("[EMU] Steps: {}, PC: 0x{:08x}, Serial: {} bytes, MMIO: {} events",
+                        steps, machine.cpu().program_counter(),
+                        machine.serial_output().len(), machine.mmio_writes().len());
+                    last_log_steps = steps;
                 }
             }
             Err(e) => {
-                app.emit("sim-status", SimStatusPayload { steps, running: false, error: Some(e) }).ok();
+                eprintln!("[EMU] ERROR in step_cpu: {}", e);
+                app.emit("sim-status", SimStatusPayload { steps, running: false, error: Some(e.clone()) }).ok();
                 return;
             }
         }
@@ -279,20 +444,35 @@ fn process_events<C: CpuCore>(
     display_size: Option<(u16, u16)>,
     app: &AppHandle,
     steps: u64,
+    uart_batch: &mut Vec<(String, u8)>,
+    uart_batch_size: usize,
+    send_frame: bool,
 ) {
-    // ── Serial / UART output ──────────────────────────────────────────────
+    // ── Serial / UART output (batched) ───────────────────────────────────
     let serial = machine.serial_output();
     for event in &serial[*serial_cursor..] {
         let is_tracked = uart_peripherals.is_empty()
             || uart_peripherals.iter().any(|u| u.eq_ignore_ascii_case(&event.peripheral));
         if is_tracked {
-            app.emit("uart-output", UartOutputPayload {
-                peripheral: event.peripheral.clone(),
-                byte: event.byte,
-            }).ok();
+            // Filter out ANSI escape sequences (simple heuristic)
+            // ANSI codes start with ESC (0x1B) followed by '['
+            // We'll strip them on the frontend side for now
+            uart_batch.push((event.peripheral.clone(), event.byte));
         }
     }
     *serial_cursor = serial.len();
+
+    // Send batch if full
+    if uart_batch.len() >= uart_batch_size {
+        // Debug: print raw bytes to confirm no duplication at source
+        let raw: String = uart_batch.iter()
+            .map(|(_, b)| if *b >= 0x20 && *b < 0x7f { *b as char } else { '·' })
+            .collect();
+        eprintln!("[EMU] UART batch ({} bytes): {:?}", uart_batch.len(), raw);
+        for (peripheral, byte) in uart_batch.drain(..) {
+            app.emit("uart-output", UartOutputPayload { peripheral, byte }).ok();
+        }
+    }
 
     // ── MMIO write events ────────────────────────────────────────────────
     let mmio = machine.mmio_writes();
@@ -313,16 +493,18 @@ fn process_events<C: CpuCore>(
     }
     *mmio_cursor = mmio.len();
 
-    // ── Display frame ─────────────────────────────────────────────────────
-    if let Some((w, h)) = display_size {
-        for p in peripherals.iter_mut() {
-            if let Some(st) = p.as_any_mut().downcast_mut::<St7789>() {
-                if let Some(frame) = st.latest_frame() {
-                    let raw: Vec<u8> = frame.iter()
-                        .flat_map(|&px| px.to_le_bytes())
-                        .collect();
-                    let data = base64::engine::general_purpose::STANDARD.encode(&raw);
-                    app.emit("display-frame", DisplayFramePayload { width: w, height: h, data }).ok();
+    // ── Display frame (throttled) ───────────────────────────────────────────
+    if send_frame {
+        if let Some((w, h)) = display_size {
+            for p in peripherals.iter_mut() {
+                if let Some(st) = p.as_any_mut().downcast_mut::<St7789>() {
+                    if let Some(frame) = st.latest_frame() {
+                        let raw: Vec<u8> = frame.iter()
+                            .flat_map(|&px| px.to_le_bytes())
+                            .collect();
+                        let data = base64::engine::general_purpose::STANDARD.encode(&raw);
+                        app.emit("display-frame", DisplayFramePayload { width: w, height: h, data }).ok();
+                    }
                 }
             }
         }

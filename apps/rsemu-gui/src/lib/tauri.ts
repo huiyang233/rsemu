@@ -41,24 +41,40 @@ export async function openFirmwareDialog(): Promise<string | null> {
   return invoke<string | null>("open_firmware_dialog");
 }
 
-// ── Event listeners ───────────────────────────────────────────────────────────
+// ── Module-level event bus ────────────────────────────────────────────────────
+// Listeners are registered once at module load time (not inside React effects),
+// so React StrictMode double-invocation cannot create duplicate subscriptions.
 
-export function onSimStatus(handler: (p: SimStatusPayload) => void): Promise<UnlistenFn> {
-  return listen<SimStatusPayload>("sim-status", (e) => handler(e.payload));
+type Handler<T> = (payload: T) => void;
+
+class EventBus<T> {
+  private handlers: Set<Handler<T>> = new Set();
+  private unlisten: UnlistenFn | null = null;
+
+  constructor(private eventName: string) {
+    // Register the single Tauri listener immediately when module loads
+    listen<T>(eventName, (e) => {
+      this.handlers.forEach((h) => h(e.payload));
+    }).then((fn) => {
+      this.unlisten = fn;
+    });
+  }
+
+  subscribe(handler: Handler<T>): () => void {
+    this.handlers.add(handler);
+    return () => this.handlers.delete(handler);
+  }
 }
 
-export function onLedChanged(handler: (p: LedChangedPayload) => void): Promise<UnlistenFn> {
-  return listen<LedChangedPayload>("led-changed", (e) => handler(e.payload));
-}
+// One bus per event type — created once when this module is first imported
+export const simStatusBus    = new EventBus<SimStatusPayload>("sim-status");
+export const ledChangedBus   = new EventBus<LedChangedPayload>("led-changed");
+export const displayFrameBus = new EventBus<DisplayFramePayload>("display-frame");
+export const uartOutputBus   = new EventBus<UartOutputPayload>("uart-output");
+export const simStepsBus     = new EventBus<number>("sim-steps");
 
+// Keep old function signatures for backward compat (used in DisplayWidget)
 export function onDisplayFrame(handler: (p: DisplayFramePayload) => void): Promise<UnlistenFn> {
-  return listen<DisplayFramePayload>("display-frame", (e) => handler(e.payload));
-}
-
-export function onUartOutput(handler: (p: UartOutputPayload) => void): Promise<UnlistenFn> {
-  return listen<UartOutputPayload>("uart-output", (e) => handler(e.payload));
-}
-
-export function onSimSteps(handler: (steps: number) => void): Promise<UnlistenFn> {
-  return listen<number>("sim-steps", (e) => handler(e.payload));
+  const unsub = displayFrameBus.subscribe(handler);
+  return Promise.resolve(unsub);
 }
