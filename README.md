@@ -61,6 +61,31 @@ active_low = true
 - `st7789`: receives SPI/GPIO traffic and can show frames in a GUI window.
 - `led`: watches a configured GPIO pin and prints state changes (`on` / `off`).
 
+## GUI (rsemu-gui)
+
+GUI app path: `apps/rsemu-gui`.
+
+Quick start:
+
+```bash
+cd apps/rsemu-gui
+npm install
+npm run tauri dev
+```
+
+Useful run modes:
+
+- Dev (fast iteration): `npm run tauri dev`
+- Backend release in dev session (higher throughput): `npm run tauri dev -- --release`
+- Build app bundle: `npm run tauri build`
+
+Notes:
+
+- GUI runtime uses realtime + unlocked render behavior for display workloads.
+- Backend prints perf stats as `[EMU][PERF] ...` every second.
+- Optional verbose step trace (for diagnosis): `RSEMU_GUI_STEP_TRACE=1 npm run tauri dev`
+- Detailed guide: `apps/rsemu-gui/doc/realtime-unlockedrender-guide.md`
+
 ## Workspace Layout
 
 - `crates/rsemu-core`: CPU, memory bus, machine runtime
