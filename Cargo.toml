@@ -37,3 +37,15 @@ toml = "0.8"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+[profile.dev.package.rsemu-core]
+opt-level = 3
+
+[profile.dev.package.rsemu-peripherals]
+opt-level = 3
+
+[profile.dev.package.rsemu-targets]
+opt-level = 3
+
+[profile.dev.package.rsemu-gui]
+opt-level = 2

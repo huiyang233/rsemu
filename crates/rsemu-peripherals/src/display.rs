@@ -149,7 +149,9 @@ impl St7789 {
         
         // Update preview periodically for real-time feel
         if self.preview_enabled && self.ramwr_pixels_written.is_multiple_of(1024) {
-            self.latest_frame_argb = Some(self.preview_argb.clone());
+            if self.latest_frame_argb.is_none() {
+                self.latest_frame_argb = Some(self.preview_argb.clone());
+            }
         }
 
         if self.cursor_x < self.window_x1 {
@@ -167,7 +169,9 @@ impl St7789 {
 
     fn emit_frame(&mut self) {
         if self.preview_enabled {
-            self.latest_frame_argb = Some(self.preview_argb.clone());
+            if self.latest_frame_argb.is_none() {
+                self.latest_frame_argb = Some(self.preview_argb.clone());
+            }
         }
         if self.dump_frames {
             let path = format!("{}/frame_{:04}.bin", self.output_dir, self.frame_id);
