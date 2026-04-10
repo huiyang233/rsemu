@@ -228,8 +228,7 @@ impl Ssd1306Core {
 
     fn snapshot_if_empty(&mut self) {
         if self.latest_frame_rgba.is_none() {
-            let len = self.preview_rgba.len();
-            self.latest_frame_rgba = Some(std::mem::replace(&mut self.preview_rgba, vec![0xFF00_0000; len]));
+            self.latest_frame_rgba = Some(self.preview_rgba.clone());
         }
     }
 }

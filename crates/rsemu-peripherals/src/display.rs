@@ -145,8 +145,7 @@ impl St7789Core {
 
         if self.preview_enabled && self.ramwr_pixels_written.is_multiple_of(1024) {
             if self.latest_frame_rgba.is_none() {
-                let len = self.preview_rgba.len();
-                self.latest_frame_rgba = Some(std::mem::replace(&mut self.preview_rgba, vec![0xFF00_0000; len]));
+                self.latest_frame_rgba = Some(self.preview_rgba.clone());
             }
         }
 
@@ -165,8 +164,9 @@ impl St7789Core {
 
     fn emit_frame(&mut self) {
         if self.preview_enabled {
-            let len = self.preview_rgba.len();
-            self.latest_frame_rgba = Some(std::mem::replace(&mut self.preview_rgba, vec![0xFF00_0000; len]));
+            // Snapshot the current framebuffer — preview_rgba is never cleared
+            // because ST7789 retains all previously written pixels.
+            self.latest_frame_rgba = Some(self.preview_rgba.clone());
         }
         if self.dump_frames {
             let path = format!("{}/frame_{:04}.bin", self.output_dir, self.frame_id);
