@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use tracing::trace;
 
 use crate::bus::SystemBus;
@@ -8,14 +9,14 @@ use crate::target::{MemoryRegionKind, TargetSpec};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerialEvent {
-    pub peripheral: String,
+    pub peripheral: Arc<str>,
     pub byte: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct MmioWriteEvent {
-    pub peripheral: String,
-    pub register: String,
+    pub peripheral: Arc<str>,
+    pub register: Arc<str>,
     pub addr: u64,
     pub width: u8,
     pub value: u32,
@@ -23,8 +24,8 @@ pub struct MmioWriteEvent {
 
 #[derive(Debug, Clone)]
 struct RegisterMeta {
-    peripheral: String,
-    register: String,
+    peripheral: Arc<str>,
+    register: Arc<str>,
     byte_offset: u8,
     flags: u16,
     systick: Option<SystickReg>,
@@ -226,7 +227,7 @@ pub trait MachineBusInterface {
 
 impl<C: CpuCore> MachineBusInterface for Machine<C> {
     fn read_mmio(&self, addr: u64) -> u8 {
-        self.mmio.get(&addr).copied().unwrap_or(0)
+        mmio_read_byte(&self.mmio, addr)
     }
 }
 
@@ -239,7 +240,7 @@ pub struct Machine<C: CpuCore> {
     periph_bb_alias_start: Option<u64>,
     periph_bb_alias_end: Option<u64>,
     memory: Vec<MemoryBlock>,
-    mmio: HashMap<u64, u8>,
+    mmio: HashMap<u64, u32>,
     register_meta: HashMap<u64, RegisterMeta>,
     usart_peripheral_map: HashMap<String, (u64, u64)>,
     usart_rx_queues: HashMap<u64, VecDeque<u8>>,
@@ -335,15 +336,18 @@ impl<C: CpuCore> Machine<C> {
                     0
                 };
                 let width = (register.width_bits / 8).clamp(1, 8) as usize;
-                let bytes = register.reset_value.to_le_bytes();
-                for (index, byte) in bytes.iter().take(width).enumerate() {
+                // Initialise mmio with the reset value; store as word-aligned u32
+                let reset_word = register.reset_value as u32;
+                write_mmio_u32(&mut mmio, register.address, reset_word);
+                let p_arc: Arc<str> = Arc::from(peripheral.name.as_str());
+                let r_arc: Arc<str> = Arc::from(register.name.as_str());
+                for index in 0..width {
                     let addr = register.address + index as u64;
-                    mmio.insert(addr, *byte);
                     register_meta.insert(
                         addr,
                         RegisterMeta {
-                            peripheral: peripheral.name.clone(),
-                            register: register.name.clone(),
+                            peripheral: Arc::clone(&p_arc),
+                            register: Arc::clone(&r_arc),
                             byte_offset: index as u8,
                             flags,
                             systick,
@@ -434,7 +438,7 @@ impl<C: CpuCore> Machine<C> {
     }
 
     pub fn read_mmio(&self, addr: u64) -> u8 {
-        self.mmio.get(&addr).copied().unwrap_or(0)
+        mmio_read_byte(&self.mmio, addr)
     }
 
     pub fn step_cpu(&mut self, max_steps: usize) -> Result<u32, String> {
@@ -598,7 +602,7 @@ impl<C: CpuCore> Machine<C> {
             .entry(sr_addr)
             .or_default()
             .push_back(byte);
-        self.mmio.insert(dr_addr, byte);
+        mmio_write_byte(&mut self.mmio, dr_addr, byte);
         Ok(())
     }
 
@@ -895,7 +899,7 @@ struct MachineBus<'a> {
     periph_bb_base: Option<u64>,
     periph_bb_alias_start: Option<u64>,
     periph_bb_alias_end: Option<u64>,
-    mmio: &'a mut HashMap<u64, u8>,
+    mmio: &'a mut HashMap<u64, u32>,
     register_meta: &'a HashMap<u64, RegisterMeta>,
     usart_rx_queues: &'a mut HashMap<u64, VecDeque<u8>>,
     serial_output: &'a mut Vec<SerialEvent>,
@@ -949,10 +953,10 @@ impl SystemBus for MachineBus<'_> {
                 if let Some(queue) = self.usart_rx_queues.get_mut(&meta.paired_addr)
                     && let Some(byte) = queue.pop_front()
                 {
-                    self.mmio.insert(addr, byte);
+                    mmio_write_byte(self.mmio, addr, byte);
                     return Ok(byte);
                 }
-                return Ok(self.mmio.get(&addr).copied().unwrap_or(0));
+                return Ok(mmio_read_byte(self.mmio, addr));
             }
             if is_spi_status(meta) {
                 let sr = spi_sr_sanitized(self.mmio, meta.paired_addr);
@@ -960,17 +964,17 @@ impl SystemBus for MachineBus<'_> {
                 return Ok(byte);
             }
             if is_spi_data(meta) && meta.byte_offset == 0 {
-                let value = self.mmio.get(&addr).copied().unwrap_or(0);
+                let value = mmio_read_byte(self.mmio, addr);
                 spi_mark_data_consumed(self.mmio, meta.paired_addr);
                 return Ok(value);
             }
         }
 
-        self.mmio
-            .get(&addr)
-            .copied()
-            .or_else(|| is_peripheral_addr(addr).then_some(0))
-            .ok_or_else(|| format!("read from unmapped address 0x{addr:08x}"))
+        if is_peripheral_addr(addr) {
+            Ok(mmio_read_byte(self.mmio, addr))
+        } else {
+            Err(format!("read from unmapped address 0x{addr:08x}"))
+        }
     }
 
     fn read_block(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), String> {
@@ -1062,7 +1066,7 @@ impl SystemBus for MachineBus<'_> {
         }
 
         if is_peripheral_addr(addr) {
-            self.mmio.insert(addr, value);
+            mmio_write_byte(self.mmio, addr, value);
             if let Some(event) = decode_mmio_write(self.register_meta, addr, 1, value as u32) {
                 self.mmio_writes.push(event);
             }
@@ -1127,37 +1131,27 @@ impl SystemBus for MachineBus<'_> {
                 return Ok(0x0000_00C0u32 | if has_rx { 1 << 5 } else { 0 });
             }
             if is_usart_data(meta) {
-                let mut b0 = self.mmio.get(&addr).copied().unwrap_or(0) as u32;
+                let mut word = read_mmio_u32(self.mmio, addr);
                 if let Some(queue) = self.usart_rx_queues.get_mut(&meta.paired_addr)
                     && let Some(byte) = queue.pop_front()
                 {
-                    b0 = u32::from(byte);
-                    self.mmio.insert(addr, byte);
+                    word = (word & !0xFF) | u32::from(byte);
+                    mmio_write_byte(self.mmio, addr, byte);
                 }
-                let b1 = self.mmio.get(&(addr + 1)).copied().unwrap_or(0) as u32;
-                let b2 = self.mmio.get(&(addr + 2)).copied().unwrap_or(0) as u32;
-                let b3 = self.mmio.get(&(addr + 3)).copied().unwrap_or(0) as u32;
-                return Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+                return Ok(word);
             }
             if is_spi_status(meta) {
                 return Ok(spi_sr_sanitized(self.mmio, meta.paired_addr));
             }
             if is_spi_data(meta) {
-                let b0 = self.mmio.get(&addr).copied().unwrap_or(0) as u32;
-                let b1 = self.mmio.get(&(addr + 1)).copied().unwrap_or(0) as u32;
-                let b2 = self.mmio.get(&(addr + 2)).copied().unwrap_or(0) as u32;
-                let b3 = self.mmio.get(&(addr + 3)).copied().unwrap_or(0) as u32;
+                let val = read_mmio_u32(self.mmio, addr);
                 spi_mark_data_consumed(self.mmio, meta.paired_addr);
-                return Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+                return Ok(val);
             }
         }
 
         if is_peripheral_addr(addr) {
-            let b0 = self.mmio.get(&addr).copied().unwrap_or(0) as u32;
-            let b1 = self.mmio.get(&(addr + 1)).copied().unwrap_or(0) as u32;
-            let b2 = self.mmio.get(&(addr + 2)).copied().unwrap_or(0) as u32;
-            let b3 = self.mmio.get(&(addr + 3)).copied().unwrap_or(0) as u32;
-            let val = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            let val = read_mmio_u32(self.mmio, addr);
             trace!("mmio.read32 @ 0x{:08x} -> 0x{:08x}", addr, val);
             return Ok(val);
         }
@@ -1206,10 +1200,7 @@ impl SystemBus for MachineBus<'_> {
         }
 
         if is_peripheral_addr(addr) {
-            let bytes = value.to_le_bytes();
-            for (index, byte) in bytes.iter().enumerate() {
-                self.mmio.insert(addr + index as u64, *byte);
-            }
+            write_mmio_u32(self.mmio, addr, value);
             if let Some(event) = decode_mmio_write(self.register_meta, addr, 4, value) {
                 self.mmio_writes.push(event);
             }
@@ -1292,31 +1283,45 @@ fn is_nvic_enable_word_addr(addr: u64) -> bool {
     addr == 0xE000_E100 || addr == 0xE000_E104
 }
 
-fn nvic_any_enabled(mmio: &HashMap<u64, u8>) -> bool {
+fn nvic_any_enabled(mmio: &HashMap<u64, u32>) -> bool {
     read_mmio_u32(mmio, 0xE000_E100) != 0 || read_mmio_u32(mmio, 0xE000_E104) != 0
 }
 
-fn read_mmio_u32(mmio: &HashMap<u64, u8>, addr: u64) -> u32 {
-    let b0 = mmio.get(&addr).copied().unwrap_or(0) as u32;
-    let b1 = mmio.get(&(addr + 1)).copied().unwrap_or(0) as u32;
-    let b2 = mmio.get(&(addr + 2)).copied().unwrap_or(0) as u32;
-    let b3 = mmio.get(&(addr + 3)).copied().unwrap_or(0) as u32;
-    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+/// Read a 32-bit value from the word-aligned mmio map.
+#[inline]
+fn read_mmio_u32(mmio: &HashMap<u64, u32>, addr: u64) -> u32 {
+    mmio.get(&(addr & !3)).copied().unwrap_or(0)
 }
 
-fn write_mmio_u32(mmio: &mut HashMap<u64, u8>, addr: u64, value: u32) {
-    for (index, byte) in value.to_le_bytes().iter().enumerate() {
-        mmio.insert(addr + index as u64, *byte);
-    }
+/// Write a 32-bit value to the word-aligned mmio map.
+#[inline]
+fn write_mmio_u32(mmio: &mut HashMap<u64, u32>, addr: u64, value: u32) {
+    mmio.insert(addr & !3, value);
 }
 
-fn nvic_pending_read(mmio: &HashMap<u64, u8>, irq: u8) -> bool {
+/// Read a single byte from the word-aligned mmio map.
+#[inline]
+fn mmio_read_byte(mmio: &HashMap<u64, u32>, addr: u64) -> u8 {
+    let shift = (addr & 3) * 8;
+    ((mmio.get(&(addr & !3)).copied().unwrap_or(0) >> shift) & 0xFF) as u8
+}
+
+/// Write a single byte into the word-aligned mmio map (read-modify-write).
+#[inline]
+fn mmio_write_byte(mmio: &mut HashMap<u64, u32>, addr: u64, value: u8) {
+    let word_addr = addr & !3;
+    let shift = (addr & 3) * 8;
+    let entry = mmio.entry(word_addr).or_insert(0);
+    *entry = (*entry & !(0xFF << shift)) | ((value as u32) << shift);
+}
+
+fn nvic_pending_read(mmio: &HashMap<u64, u32>, irq: u8) -> bool {
     let reg = 0xE000_E200u64 + (u64::from(irq / 32) * 4);
     let bit = irq % 32;
     (read_mmio_u32(mmio, reg) & (1u32 << bit)) != 0
 }
 
-fn nvic_pending_write(mmio: &mut HashMap<u64, u8>, irq: u8, pending: bool) {
+fn nvic_pending_write(mmio: &mut HashMap<u64, u32>, irq: u8, pending: bool) {
     let reg = 0xE000_E200u64 + (u64::from(irq / 32) * 4);
     let bit = irq % 32;
     let mut value = read_mmio_u32(mmio, reg);
@@ -1417,7 +1422,7 @@ fn timer_enable_bit(peripheral: &str, rcc: RccRegs) -> Option<(u64, u8)> {
 }
 
 fn write_special_mmio(
-    mmio: &mut HashMap<u64, u8>,
+    mmio: &mut HashMap<u64, u32>,
     serial_output: &mut Vec<SerialEvent>,
     mmio_writes: &mut Vec<MmioWriteEvent>,
     register_meta: &HashMap<u64, RegisterMeta>,
@@ -1425,8 +1430,8 @@ fn write_special_mmio(
     addr: u64,
     value: u8,
 ) -> bool {
-    if let Some(meta) = register_meta.get(&addr).cloned() {
-        if is_rcc_control(&meta) || is_rcc_csr(&meta) || is_pwr_csr(&meta) {
+    if let Some(meta) = register_meta.get(&addr) {
+        if is_rcc_control(meta) || is_rcc_csr(meta) || is_pwr_csr(meta) {
             let base_addr = addr & !3;
             let old_val = read_mmio_u32(mmio, base_addr);
             let merged = merge_mmio_write(old_val, addr, 1, value as u32);
@@ -1437,7 +1442,7 @@ fn write_special_mmio(
             }
             return true;
         }
-        if is_rcc_cfgr(&meta) {
+        if is_rcc_cfgr(meta) {
             let base_addr = addr & !3;
             let old_val = read_mmio_u32(mmio, base_addr);
             let merged = merge_mmio_write(old_val, addr, 1, value as u32);
@@ -1451,25 +1456,25 @@ fn write_special_mmio(
 
         if let Some(reg) = meta.systick {
             systick.write8(reg, meta.byte_offset, value);
-            mmio.insert(addr, value);
+            mmio_write_byte(mmio, addr, value);
             if let Some(event) = decode_mmio_write(register_meta, addr, 1, value as u32) {
                 mmio_writes.push(event);
             }
             return true;
         }
-        if is_usart_data(&meta) && meta.byte_offset == 0 {
+        if is_usart_data(meta) && meta.byte_offset == 0 {
             serial_output.push(SerialEvent {
-                peripheral: meta.peripheral,
+                peripheral: Arc::clone(&meta.peripheral),
                 byte: value,
             });
             if let Some(event) = decode_mmio_write(register_meta, addr, 1, value as u32) {
                 mmio_writes.push(event);
             }
-            mmio.insert(addr, value);
+            mmio_write_byte(mmio, addr, value);
             return true;
         }
-        if is_spi_data(&meta) && meta.byte_offset == 0 {
-            mmio.insert(addr, value);
+        if is_spi_data(meta) && meta.byte_offset == 0 {
+            mmio_write_byte(mmio, addr, value);
             if let Some(event) = decode_mmio_write(register_meta, addr, 1, value as u32) {
                 mmio_writes.push(event);
             }
@@ -1482,7 +1487,7 @@ fn write_special_mmio(
 }
 
 fn write_special_mmio_u32(
-    mmio: &mut HashMap<u64, u8>,
+    mmio: &mut HashMap<u64, u32>,
     serial_output: &mut Vec<SerialEvent>,
     mmio_writes: &mut Vec<MmioWriteEvent>,
     register_meta: &HashMap<u64, RegisterMeta>,
@@ -1490,8 +1495,8 @@ fn write_special_mmio_u32(
     addr: u64,
     value: u32,
 ) -> bool {
-    if let Some(meta) = register_meta.get(&addr).cloned() {
-        if is_rcc_control(&meta) {
+    if let Some(meta) = register_meta.get(&addr) {
+        if is_rcc_control(meta) {
             let base_addr = addr & !3;
             let old_val = read_mmio_u32(mmio, base_addr);
             let merged = merge_mmio_write(old_val, addr, 4, value);
@@ -1502,7 +1507,7 @@ fn write_special_mmio_u32(
             }
             return true;
         }
-        if is_rcc_cfgr(&meta) {
+        if is_rcc_cfgr(meta) {
             let base_addr = addr & !3;
             let old_val = read_mmio_u32(mmio, base_addr);
             let merged = merge_mmio_write(old_val, addr, 4, value);
@@ -1513,18 +1518,7 @@ fn write_special_mmio_u32(
             }
             return true;
         }
-        if is_rcc_csr(&meta) {
-            let base_addr = addr & !3;
-            let old_val = read_mmio_u32(mmio, base_addr);
-            let merged = merge_mmio_write(old_val, addr, 4, value);
-            let updated = apply_rcc_ready_flags(base_addr, old_val, merged);
-            write_mmio_u32(mmio, base_addr, updated);
-            if let Some(event) = decode_mmio_write(register_meta, base_addr, 4, updated) {
-                mmio_writes.push(event);
-            }
-            return true;
-        }
-        if is_pwr_csr(&meta) {
+        if is_rcc_csr(meta) || is_pwr_csr(meta) {
             let base_addr = addr & !3;
             let old_val = read_mmio_u32(mmio, base_addr);
             let merged = merge_mmio_write(old_val, addr, 4, value);
@@ -1539,9 +1533,7 @@ fn write_special_mmio_u32(
         if let Some(reg) = meta.systick {
             if meta.byte_offset == 0 {
                 systick.write32(reg, value);
-                for (index, byte) in value.to_le_bytes().iter().enumerate() {
-                    mmio.insert(addr + index as u64, *byte);
-                }
+                write_mmio_u32(mmio, addr, value);
                 if let Some(event) = decode_mmio_write(register_meta, addr, 4, value) {
                     mmio_writes.push(event);
                 }
@@ -1550,8 +1542,7 @@ fn write_special_mmio_u32(
         }
 
         if meta.byte_offset == 0 {
-
-            if is_timer_status(&meta) {
+            if is_timer_status(meta) {
                 let current = read_mmio_u32(mmio, addr);
                 let merged = current & value;
                 write_mmio_u32(mmio, addr, merged);
@@ -1560,7 +1551,7 @@ fn write_special_mmio_u32(
                 }
                 return true;
             }
-            if is_gpio_bsrr(&meta) {
+            if is_gpio_bsrr(meta) {
                 write_mmio_u32(mmio, addr, value);
                 if let Some(event) = decode_mmio_write(register_meta, addr, 4, value) {
                     mmio_writes.push(event);
@@ -1578,23 +1569,19 @@ fn write_special_mmio_u32(
                 }
                 return true;
             }
-            if is_usart_data(&meta) && meta.byte_offset == 0 {
+            if is_usart_data(meta) {
                 serial_output.push(SerialEvent {
-                    peripheral: meta.peripheral,
+                    peripheral: Arc::clone(&meta.peripheral),
                     byte: (value & 0xFF) as u8,
                 });
                 if let Some(event) = decode_mmio_write(register_meta, addr, 4, value) {
                     mmio_writes.push(event);
                 }
-                for (index, byte) in value.to_le_bytes().iter().enumerate() {
-                    mmio.insert(addr + index as u64, *byte);
-                }
+                write_mmio_u32(mmio, addr, value);
                 return true;
             }
-            if is_spi_data(&meta) {
-                for (index, byte) in value.to_le_bytes().iter().enumerate() {
-                    mmio.insert(addr + index as u64, *byte);
-                }
+            if is_spi_data(meta) {
+                write_mmio_u32(mmio, addr, value);
                 if let Some(event) = decode_mmio_write(register_meta, addr, 4, value) {
                     mmio_writes.push(event);
                 }
@@ -1609,7 +1596,7 @@ fn write_special_mmio_u32(
 
 #[allow(clippy::too_many_arguments)]
 fn write_periph_bitband_alias(
-    mmio: &mut HashMap<u64, u8>,
+    mmio: &mut HashMap<u64, u32>,
     mmio_writes: &mut Vec<MmioWriteEvent>,
     register_meta: &HashMap<u64, RegisterMeta>,
     alias_addr: u64,
@@ -1632,14 +1619,14 @@ fn write_periph_bitband_alias(
     let byte_offset = bit_word_offset / 32;
     let bit = ((bit_word_offset % 32) / 4) as u8;
     let target_addr = periph_bb_base + byte_offset;
-    let current = mmio.get(&target_addr).copied().unwrap_or(0);
+    let current = mmio_read_byte(mmio, target_addr);
     let bit_mask = 1u8 << bit;
     let updated = if value & 1 == 0 {
         current & !bit_mask
     } else {
         current | bit_mask
     };
-    mmio.insert(target_addr, updated);
+    mmio_write_byte(mmio, target_addr, updated);
 
     if let Some(event) = decode_mmio_write(register_meta, target_addr, 1, updated as u32) {
         mmio_writes.push(event);
@@ -1746,7 +1733,7 @@ fn classify_systick_reg(peripheral: &str, register: &str) -> Option<SystickReg> 
     None
 }
 
-fn spi_sr_sanitized(mmio: &HashMap<u64, u8>, sr_addr: u64) -> u32 {
+fn spi_sr_sanitized(mmio: &HashMap<u64, u32>, sr_addr: u64) -> u32 {
     let mut sr = if sr_addr == 0 {
         0
     } else {
@@ -1760,7 +1747,7 @@ fn spi_sr_sanitized(mmio: &HashMap<u64, u8>, sr_addr: u64) -> u32 {
     sr
 }
 
-fn spi_mark_data_written(mmio: &mut HashMap<u64, u8>, sr_addr: u64) {
+fn spi_mark_data_written(mmio: &mut HashMap<u64, u32>, sr_addr: u64) {
     if sr_addr != 0 {
         let mut sr = read_mmio_u32(mmio, sr_addr);
         sr |= (1 << 1) | (1 << 0); // TXE + RXNE
@@ -1770,7 +1757,7 @@ fn spi_mark_data_written(mmio: &mut HashMap<u64, u8>, sr_addr: u64) {
     }
 }
 
-fn spi_mark_data_consumed(mmio: &mut HashMap<u64, u8>, sr_addr: u64) {
+fn spi_mark_data_consumed(mmio: &mut HashMap<u64, u32>, sr_addr: u64) {
     if sr_addr != 0 {
         let mut sr = read_mmio_u32(mmio, sr_addr);
         sr &= !(1 << 0); // RXNE cleared on DR read
@@ -1833,8 +1820,8 @@ fn decode_mmio_write(
 ) -> Option<MmioWriteEvent> {
     if let Some(meta) = register_meta.get(&addr) {
         return Some(MmioWriteEvent {
-            peripheral: meta.peripheral.clone(),
-            register: meta.register.clone(),
+            peripheral: Arc::clone(&meta.peripheral),
+            register: Arc::clone(&meta.register),
             addr,
             width,
             value,

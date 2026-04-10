@@ -471,12 +471,12 @@ let config = registry.get_config(id)
 | F-02 | gpio_idr_addr panic | ✅ 已修复 | 改为 Result<u64, String>，调用方处理错误 |
 | F-03 | Unicorn init panic | ✅ 已修复 | CortexM3/M4::new() 返回 Result，emulator.rs emit 错误事件 |
 | F-04 | 启动 panic | ✅ 已修复 | 移到 .setup() 钩子，返回 Result，Tauri 捕获并展示 |
-| F-05 | MMIO HashMap<u64,u8> 性能 | ⬜ 待修复 | |
-| F-06 | decode_mmio_write String clone | ⬜ 待修复 | |
-| F-07 | RegisterMeta.cloned() | ⬜ 待修复 | |
+| F-05 | MMIO HashMap<u64,u8> 性能 | ✅ 已修复 | HashMap<u64,u32> word-aligned，单次查找替代 4 次 |
+| F-06 | decode_mmio_write String clone | ✅ 已修复 | RegisterMeta/MmioWriteEvent 改为 Arc<str> |
+| F-07 | RegisterMeta.cloned() | ✅ 已修复 | 改为借用 register_meta.get(&addr)，不再 .cloned() |
 | F-08 | read_bus_bytes Vec 分配 | ✅ 已修复 | 改为 [u8; 8] 栈上 buffer |
-| F-09 | 帧缓冲 Rust 侧 3 次拷贝 | ⬜ 待修复 | |
-| F-10 | 帧缓冲 JS 侧 3 次拷贝 | ⬜ 待修复 | |
+| F-09 | 帧缓冲 Rust 侧 3 次拷贝 | ✅ 已修复 | std::mem::replace 替代 clone()，像素格式改 RGBA |
+| F-10 | 帧缓冲 JS 侧 3 次拷贝 | ✅ 已修复 | Rust 输出 RGBA，JS 直接 new ImageData 省去 swap 循环 |
 | F-11 | uart_batch 失效 | ✅ 已修复 | 去掉 !is_empty() 条件，仅按 batch size flush，Stop 时 flush |
 | F-12 | UART 每字节 re-render | ✅ 已修复 | 批量接收 bytes[]，64KB 环形缓冲，xterm 用 Uint8Array |
 | F-13 | PeripheralConfig 封闭枚举 | ⬜ 待修复 | |
@@ -486,7 +486,7 @@ let config = registry.get_config(id)
 | F-17 | write_special_mmio 8/32位重复 | ⬜ 待修复 | |
 | F-18 | CpuType 封闭 match | ⬜ 待修复 | |
 | F-19 | 热路径 uppercase 分配 | ⬜ 待修复 | |
-| F-20 | gpio char→String 分配 | ⬜ 待修复 | |
-| F-21 | params Vec<u8> for 4 bytes | ⬜ 待修复 | |
+| F-20 | gpio char→String 分配 | ✅ 已修复 | 改为 char 直接比较，去掉 .to_string() |
+| F-21 | params Vec<u8> for 4 bytes | ✅ 已修复 | 改为 params_buf: [u8;4] + params_len: u8 栈上固定大小 |
 | F-22 | unsafe transmute 无注释 | ⬜ 待修复 | |
 | F-23 | unwrap() in get_boards | ✅ 已修复 | 改为 ok_or_else 返回 Result |

@@ -12,7 +12,7 @@ export interface LedChangedPayload {
 export interface DisplayFramePayload {
   width: number;
   height: number;
-  /** ARGB pixels, base64-encoded (4 bytes per pixel, LE) */
+  /** RGBA pixels, base64-encoded (4 bytes per pixel, LE) */
   data: string;
 }
 

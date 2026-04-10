@@ -381,7 +381,7 @@ fn stream_new_events<C: CpuCore>(
                 }
             }
         } else {
-            let line = serial_lines.entry(event.peripheral.clone()).or_default();
+            let line = serial_lines.entry(event.peripheral.to_string()).or_default();
             line.push(event.byte);
             if event.byte == b'\n' {
                 let text = String::from_utf8_lossy(line);

@@ -2,6 +2,7 @@ use base64::Engine;
 use rsemu_core::cpu::armv7em::CortexM4;
 use rsemu_core::cpu::armv7m::CortexM3;
 use rsemu_core::TargetSpec;
+use std::sync::Arc;
 use tauri::Emitter;
 use std::time::{Duration, Instant};
 
@@ -141,7 +142,7 @@ struct LedChangedPayload {
 struct DisplayFramePayload {
     width: u16,
     height: u16,
-    /// ARGB pixels encoded as base64 (4 bytes per pixel, little-endian)
+    /// RGBA pixels encoded as base64 (4 bytes per pixel, little-endian)
     data: String,
 }
 
@@ -361,7 +362,7 @@ fn run_machine<C: CpuCore>(
     let mut next_steps_emit_deadline = Instant::now();
 
     // UART batching: collect bytes and send in batches
-    let mut uart_batch: Vec<(String, u8)> = Vec::new();
+    let mut uart_batch: Vec<(Arc<str>, u8)> = Vec::new();
     let uart_batch_size = 64;
 
     // Realtime + UnlockedRender: keep real-time pacing, but emit frames by wall-clock.
@@ -521,7 +522,7 @@ fn run_machine<C: CpuCore>(
     }
 }
 
-fn flush_uart_batch(app: &AppHandle, batch: &mut Vec<(String, u8)>) {
+fn flush_uart_batch(app: &AppHandle, batch: &mut Vec<(Arc<str>, u8)>) {
     if batch.is_empty() {
         return;
     }
@@ -529,7 +530,7 @@ fn flush_uart_batch(app: &AppHandle, batch: &mut Vec<(String, u8)>) {
     let mut by_peripheral: std::collections::HashMap<String, Vec<u8>> =
         std::collections::HashMap::new();
     for (peripheral, byte) in batch.drain(..) {
-        by_peripheral.entry(peripheral).or_default().push(byte);
+        by_peripheral.entry(peripheral.to_string()).or_default().push(byte);
     }
     for (peripheral, bytes) in by_peripheral {
         app.emit("uart-output", UartOutputPayload { peripheral, bytes }).ok();
@@ -546,7 +547,7 @@ fn process_events<C: CpuCore>(
     has_display: bool,
     app: &AppHandle,
     clocks: &mut RccClockModel,
-    uart_batch: &mut Vec<(String, u8)>,
+    uart_batch: &mut Vec<(Arc<str>, u8)>,
     uart_batch_size: usize,
     frame_interval: Duration,
     next_frame_deadline: &mut Instant,
@@ -597,7 +598,7 @@ fn process_events<C: CpuCore>(
             for frame in bus_ctx.poll_frames() {
                 stats.frame_emitted = true;
                 let frame_encode_begin = Instant::now();
-                let data = encode_argb_frame_base64(&frame.pixels);
+                let data = encode_rgba_frame_base64(&frame.pixels);
                 stats.frame_encode_ns = stats
                     .frame_encode_ns
                     .saturating_add(frame_encode_begin.elapsed().as_nanos());
@@ -617,7 +618,7 @@ fn process_events<C: CpuCore>(
     stats
 }
 
-fn encode_argb_frame_base64(frame: &[u32]) -> String {
+fn encode_rgba_frame_base64(frame: &[u32]) -> String {
     if cfg!(target_endian = "little") {
         let raw = unsafe {
             std::slice::from_raw_parts(

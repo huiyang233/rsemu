@@ -33,7 +33,7 @@ impl RccClockModel {
         if let Some(hz) = self.apply_systick_load_hint(event) {
             return Some(hz);
         }
-        if event.peripheral != "RCC" {
+        if !event.peripheral.eq_ignore_ascii_case("RCC") {
             return None;
         }
 

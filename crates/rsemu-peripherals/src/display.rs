@@ -18,7 +18,8 @@ pub struct St7789Core {
     pub dump_frames: bool,
     pub frame_id: u32,
     pub current_cmd: Option<u8>,
-    pub params: Vec<u8>,
+    pub params_buf: [u8; 4],
+    pub params_len: u8,
     pub window_x0: u16,
     pub window_x1: u16,
     pub window_y0: u16,
@@ -27,8 +28,8 @@ pub struct St7789Core {
     pub cursor_y: u16,
     pub pixel_hi: Option<u8>,
     pub ramwr_pixels_written: u32,
-    pub latest_frame_argb: Option<Vec<u32>>,
-    pub preview_argb: Vec<u32>,
+    pub latest_frame_rgba: Option<Vec<u32>>,
+    pub preview_rgba: Vec<u32>,
     pub preview_enabled: bool,
     pub dc: bool,
     pub cs_active: bool,
@@ -54,7 +55,8 @@ impl St7789Core {
             dump_frames,
             frame_id: 0,
             current_cmd: None,
-            params: Vec::new(),
+            params_buf: [0; 4],
+            params_len: 0,
             window_x0: 0,
             window_x1: width.saturating_sub(1),
             window_y0: 0,
@@ -65,8 +67,8 @@ impl St7789Core {
             dc: false,
             cs_active: false,
             ramwr_pixels_written: 0,
-            latest_frame_argb: None,
-            preview_argb: if preview_enabled {
+            latest_frame_rgba: None,
+            preview_rgba: if preview_enabled {
                 vec![0; usize::from(width) * usize::from(height)]
             } else {
                 Vec::new()
@@ -77,7 +79,7 @@ impl St7789Core {
 
     pub fn write_command(&mut self, cmd: u8) {
         self.current_cmd = Some(cmd);
-        self.params.clear();
+        self.params_len = 0;
         self.pixel_hi = None;
         if cmd == 0x2C {
             self.cursor_x = self.window_x0;
@@ -89,18 +91,24 @@ impl St7789Core {
     pub fn write_data(&mut self, byte: u8) {
         match self.current_cmd {
             Some(0x2A) => {
-                self.params.push(byte);
-                if self.params.len() == 4 {
-                    self.window_x0 = u16::from_be_bytes([self.params[0], self.params[1]]);
-                    self.window_x1 = u16::from_be_bytes([self.params[2], self.params[3]]);
+                if (self.params_len as usize) < self.params_buf.len() {
+                    self.params_buf[self.params_len as usize] = byte;
+                    self.params_len += 1;
+                }
+                if self.params_len == 4 {
+                    self.window_x0 = u16::from_be_bytes([self.params_buf[0], self.params_buf[1]]);
+                    self.window_x1 = u16::from_be_bytes([self.params_buf[2], self.params_buf[3]]);
                     info!("st7789.window.x = {}..{}", self.window_x0, self.window_x1);
                 }
             }
             Some(0x2B) => {
-                self.params.push(byte);
-                if self.params.len() == 4 {
-                    self.window_y0 = u16::from_be_bytes([self.params[0], self.params[1]]);
-                    self.window_y1 = u16::from_be_bytes([self.params[2], self.params[3]]);
+                if (self.params_len as usize) < self.params_buf.len() {
+                    self.params_buf[self.params_len as usize] = byte;
+                    self.params_len += 1;
+                }
+                if self.params_len == 4 {
+                    self.window_y0 = u16::from_be_bytes([self.params_buf[0], self.params_buf[1]]);
+                    self.window_y1 = u16::from_be_bytes([self.params_buf[2], self.params_buf[3]]);
                     info!("st7789.window.y = {}..{}", self.window_y0, self.window_y1);
                 }
             }
@@ -127,16 +135,17 @@ impl St7789Core {
             self.framebuffer[idx] = pixel;
             if self.preview_enabled {
                 let rgb = rgb565_to_rgb888(pixel);
-                self.preview_argb[idx] =
-                    0xFF00_0000 | (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]);
+                self.preview_rgba[idx] =
+                    (u32::from(rgb[0]) << 24) | (u32::from(rgb[1]) << 16) | (u32::from(rgb[2]) << 8) | 0xFF;
             }
         }
 
         self.ramwr_pixels_written = self.ramwr_pixels_written.saturating_add(1);
 
         if self.preview_enabled && self.ramwr_pixels_written.is_multiple_of(1024) {
-            if self.latest_frame_argb.is_none() {
-                self.latest_frame_argb = Some(self.preview_argb.clone());
+            if self.latest_frame_rgba.is_none() {
+                let len = self.preview_rgba.len();
+                self.latest_frame_rgba = Some(std::mem::replace(&mut self.preview_rgba, vec![0; len]));
             }
         }
 
@@ -155,8 +164,9 @@ impl St7789Core {
 
     fn emit_frame(&mut self) {
         if self.preview_enabled {
-            if self.latest_frame_argb.is_none() {
-                self.latest_frame_argb = Some(self.preview_argb.clone());
+            if self.latest_frame_rgba.is_none() {
+                let len = self.preview_rgba.len();
+                self.latest_frame_rgba = Some(std::mem::replace(&mut self.preview_rgba, vec![0; len]));
             }
         }
         if self.dump_frames {
@@ -175,7 +185,7 @@ impl St7789Core {
     }
 
     pub fn latest_frame(&mut self) -> Option<Vec<u32>> {
-        self.latest_frame_argb.take()
+        self.latest_frame_rgba.take()
     }
 }
 
@@ -252,7 +262,7 @@ impl SpiSlave for St7789 {
     fn reset(&mut self) {
         // Keep framebuffer and dimensions, reset protocol state
         self.core.current_cmd = None;
-        self.core.params.clear();
+        self.core.params_len = 0;
         self.core.pixel_hi = None;
     }
 
@@ -265,11 +275,11 @@ impl SpiSlave for St7789 {
     }
 
     fn gpio_pin_changed(&mut self, port: char, pin: u8, high: bool) {
-        let port_upper = port.to_ascii_uppercase();
-        if port_upper.to_string() == self.cs.port.to_ascii_uppercase() && pin == self.cs.pin {
+        let pu = port.to_ascii_uppercase();
+        if pu == self.cs.port.chars().next().unwrap_or('\0').to_ascii_uppercase() && pin == self.cs.pin {
             self.core.cs_active = !high; // CS is active-low: pin LOW = selected
         }
-        if port_upper.to_string() == self.dc.port.to_ascii_uppercase() && pin == self.dc.pin {
+        if pu == self.dc.port.chars().next().unwrap_or('\0').to_ascii_uppercase() && pin == self.dc.pin {
             self.core.dc = high; // DC is active-high: pin HIGH = data mode
         }
     }
@@ -281,11 +291,11 @@ impl SpiSlave for St7789 {
 
 impl GpioListener for St7789 {
     fn pin_changed(&mut self, port: char, pin: u8, high: bool) {
-        let port_upper = port.to_ascii_uppercase();
-        if port_upper.to_string() == self.cs.port.to_ascii_uppercase() && pin == self.cs.pin {
+        let pu = port.to_ascii_uppercase();
+        if pu == self.cs.port.chars().next().unwrap_or('\0').to_ascii_uppercase() && pin == self.cs.pin {
             self.core.cs_active = !high; // CS is active-low: pin LOW = selected
         }
-        if port_upper.to_string() == self.dc.port.to_ascii_uppercase() && pin == self.dc.pin {
+        if pu == self.dc.port.chars().next().unwrap_or('\0').to_ascii_uppercase() && pin == self.dc.pin {
             self.core.dc = high; // DC is active-high: pin HIGH = data mode
         }
     }
@@ -314,7 +324,7 @@ impl ParallelDevice for St7789 {
 
     fn reset(&mut self) {
         self.core.current_cmd = None;
-        self.core.params.clear();
+        self.core.params_len = 0;
         self.core.pixel_hi = None;
     }
 

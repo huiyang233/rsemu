@@ -37,8 +37,8 @@ pub struct Ssd1306Core {
     pub pending_filled: u8,
 
     pub gddram: Vec<u8>,
-    pub preview_argb: Vec<u32>,
-    pub latest_frame_argb: Option<Vec<u32>>,
+    pub preview_rgba: Vec<u32>,
+    pub latest_frame_rgba: Option<Vec<u32>>,
     pub data_bytes_written: u32,
 }
 
@@ -65,14 +65,14 @@ impl Ssd1306Core {
             pending_args: [0; 2],
             pending_filled: 0,
             gddram: vec![0; fb_len],
-            preview_argb: vec![0xFF00_0000; px_len],
-            latest_frame_argb: None,
+            preview_rgba: vec![0xFF00_0000; px_len],
+            latest_frame_rgba: None,
             data_bytes_written: 0,
         }
     }
 
     pub fn latest_frame(&mut self) -> Option<Vec<u32>> {
-        self.latest_frame_argb.take()
+        self.latest_frame_rgba.take()
     }
 
     fn command_arg_count(cmd: u8) -> u8 {
@@ -185,7 +185,8 @@ impl Ssd1306Core {
             }
             let on = ((byte >> bit) & 1) != 0;
             let px = y * usize::from(self.width) + x;
-            self.preview_argb[px] = if on { 0xFFFF_FFFF } else { 0xFF00_0000 };
+            // RGBA format: white = 0xFFFFFF_FF, black = 0x000000_FF
+            self.preview_rgba[px] = if on { 0xFFFF_FF_FF } else { 0x0000_00_FF };
         }
     }
 
@@ -226,8 +227,9 @@ impl Ssd1306Core {
     }
 
     fn snapshot_if_empty(&mut self) {
-        if self.latest_frame_argb.is_none() {
-            self.latest_frame_argb = Some(self.preview_argb.clone());
+        if self.latest_frame_rgba.is_none() {
+            let len = self.preview_rgba.len();
+            self.latest_frame_rgba = Some(std::mem::replace(&mut self.preview_rgba, vec![0x0000_00_FF; len]));
         }
     }
 }

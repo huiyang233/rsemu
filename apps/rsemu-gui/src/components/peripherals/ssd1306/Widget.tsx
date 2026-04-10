@@ -22,21 +22,12 @@ export default function Ssd1306Widget({ config }: Props) {
       const canvas = canvasRef.current;
       if (!canvas) return;
 
+      // Decode base64 → bytes (RGBA, 4 bytes per pixel)
       const binary = atob(data);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
-      const rgba = new Uint8ClampedArray(width * height * 4);
-      for (let i = 0; i < width * height; i++) {
-        const b = bytes[i * 4 + 0];
-        const g = bytes[i * 4 + 1];
-        const r = bytes[i * 4 + 2];
-        const a = bytes[i * 4 + 3];
-        rgba[i * 4 + 0] = r;
-        rgba[i * 4 + 1] = g;
-        rgba[i * 4 + 2] = b;
-        rgba[i * 4 + 3] = a === 0 ? 255 : a;
-      }
+      const rgba = new Uint8ClampedArray(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 
       canvas.width = width;
       canvas.height = height;
