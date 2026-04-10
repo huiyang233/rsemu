@@ -192,9 +192,25 @@ fn next_larger_batch(v: usize) -> usize {
     }
 }
 
-use rsemu_core::{CpuCore, FirmwareLoader, Machine, MmioWriteEvent};
+fn normalize_ssd1306_size(width: u16, height: u16) -> (u16, u16) {
+    let w = match width {
+        64 | 72 | 96 | 128 => width,
+        _ => 128,
+    };
+    let h = match height {
+        32 | 40 | 48 | 64 => height,
+        _ => 64,
+    };
+    (w, h)
+}
+
+use rsemu_core::{
+    CpuCore, FirmwareLoader, GpioListener, GpioNotifier, GpioPin, I2cSlave, Machine,
+    MmioWriteEvent, SpiSlave, TargetSpec,
+};
 use rsemu_peripherals::display::St7789;
-use rsemu_peripherals::Peripheral;
+use rsemu_peripherals::led::Led;
+use rsemu_peripherals::ssd1306::Ssd1306I2c;
 use rsemu_targets::stm32::{f103, f407};
 use serde::Serialize;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -241,32 +257,91 @@ struct EventProcessStats {
     frame_encode_ns: u128,
 }
 
-// ── LED state tracker ────────────────────────────────────────────────────────
+// ── Bus-device context (replaces Vec<Box<dyn Peripheral>> + LedTracker) ─────
 
-struct LedTracker {
+/// Tracks which SPI peripheral an ST7789 display is connected to.
+struct St7789BusHandle {
+    spi_peripheral: String, // e.g. "SPI1"
+    cs_port: char,
+    cs_pin: u8,
+    dc_port: char,
+    dc_pin: u8,
+    device: St7789,
+}
+
+/// Tracks which I2C peripheral an SSD1306 OLED is connected to.
+/// Contains a minimal I2C protocol state machine (START/STOP/address/data)
+/// and routes events to the I2cSlave trait methods on the device.
+struct Ssd1306BusHandle {
+    i2c_peripheral: String, // e.g. "I2C1"
+    device: Ssd1306I2c,
+    i2c_phase: I2cPhase,
+}
+
+/// Minimal I2C master state for protocol routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum I2cPhase {
+    Idle,
+    AwaitAddress,
+    MasterWrite,
+}
+
+impl Ssd1306BusHandle {
+    fn on_cr1_write(&mut self, value: u32) {
+        // START condition
+        if (value & (1 << 8)) != 0 {
+            self.i2c_phase = I2cPhase::AwaitAddress;
+        }
+        // STOP condition
+        if (value & (1 << 9)) != 0 {
+            if self.i2c_phase != I2cPhase::Idle {
+                self.device.stop();
+            }
+            self.i2c_phase = I2cPhase::Idle;
+        }
+    }
+
+    fn on_dr_write(&mut self, byte: u8) {
+        match self.i2c_phase {
+            I2cPhase::AwaitAddress => {
+                let addr7 = byte >> 1;
+                let read = (byte & 1) != 0;
+                if self.device.address(addr7, read) && !read {
+                    self.i2c_phase = I2cPhase::MasterWrite;
+                } else {
+                    self.i2c_phase = I2cPhase::Idle;
+                }
+            }
+            I2cPhase::MasterWrite => {
+                self.device.write_byte(byte);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Tracks an LED connected to a GPIO pin, for Tauri event emission.
+struct LedHandle {
     id: String,
-    gpio_peripheral: String,
-    short_peripheral: String,
+    port: char,
     pin: u8,
     active_low: bool,
     level_high: bool,
     last_on: Option<bool>,
 }
 
-impl LedTracker {
-    fn port_matches(&self, peripheral: &str) -> bool {
-        peripheral.eq_ignore_ascii_case(&self.gpio_peripheral)
-            || peripheral.eq_ignore_ascii_case(&self.short_peripheral)
-    }
-
+impl LedHandle {
     fn on_state(&self) -> bool {
         if self.active_low { !self.level_high } else { self.level_high }
     }
 
-    /// Returns true if the visible state changed.
-    fn process_mmio(&mut self, event: &MmioWriteEvent) -> bool {
-        if !self.port_matches(&event.peripheral) {
-            return false;
+    /// Process an MMIO event. Returns Some(true/false) if LED state changed.
+    fn process_mmio(&mut self, event: &MmioWriteEvent) -> Option<bool> {
+        // Check port match — event peripheral is like "GPIOA" or "A"
+        let port_matches = event.peripheral.eq_ignore_ascii_case(&format!("GPIO{}", self.port))
+            || event.peripheral.eq_ignore_ascii_case(&self.port.to_string());
+        if !port_matches {
+            return None;
         }
         if event.register.eq_ignore_ascii_case("ODR") {
             self.level_high = ((event.value >> self.pin) & 1) != 0;
@@ -275,14 +350,16 @@ impl LedTracker {
             let reset = ((event.value >> (self.pin + 16)) & 1) != 0;
             if set { self.level_high = true; }
             else if reset { self.level_high = false; }
-            else { return false; }
+            else { return None; }
         } else {
-            return false;
+            return None;
         }
         let on = self.on_state();
-        if self.last_on == Some(on) { return false; }
+        if self.last_on == Some(on) {
+            return None;
+        }
         self.last_on = Some(on);
-        true
+        Some(on)
     }
 }
 
@@ -294,6 +371,16 @@ fn gpio_idr_addr(port: char, is_f407: bool) -> u64 {
         0x4002_0000 + idx * 0x400 + 0x10
     } else {
         0x4001_0800 + idx * 0x400 + 0x08
+    }
+}
+
+fn gpio_port_letter(name: &str) -> Option<char> {
+    if name.starts_with("GPIO") {
+        name.chars().nth(4)
+    } else if name.len() == 1 && name.chars().next().unwrap_or('\0').is_ascii_alphabetic() {
+        name.chars().next()
+    } else {
+        None
     }
 }
 
@@ -335,7 +422,7 @@ pub fn run_emulator(config: SimConfig, app: AppHandle, control_rx: Receiver<Cont
 
 fn run_machine<C: CpuCore>(
     cpu: C,
-    target: rsemu_core::TargetSpec,
+    target: TargetSpec,
     config: SimConfig,
     app: AppHandle,
     control_rx: Receiver<ControlMsg>,
@@ -345,7 +432,7 @@ fn run_machine<C: CpuCore>(
     let core_clock_hz = target.core_clock_hz;
     let systick_reload_divider = target.systick_reload_divider;
 
-    let mut machine = Machine::new(cpu, target);
+    let mut machine = Machine::new(cpu, target.clone());
 
     // Load firmware
     eprintln!("[EMU] Loading firmware from: {}", config.firmware_path);
@@ -377,11 +464,12 @@ fn run_machine<C: CpuCore>(
     }
     eprintln!("[EMU] CPU reset complete. Initial PC: 0x{:08x}", machine.cpu().program_counter());
 
-    // Build peripheral list and LED trackers
-    let mut peripherals: Vec<Box<dyn Peripheral>> = Vec::new();
-    let mut led_trackers: Vec<LedTracker> = Vec::new();
+    // ── Build bus-device context ───────────────────────────────────────────
+    let mut st7789_handles: Vec<St7789BusHandle> = Vec::new();
+    let mut ssd1306_handles: Vec<Ssd1306BusHandle> = Vec::new();
+    let mut led_handles: Vec<LedHandle> = Vec::new();
     let mut uart_peripherals: Vec<String> = Vec::new();
-    let mut display_size: Option<(u16, u16)> = None;
+    let mut gpio_notifier = GpioNotifier::new();
 
     eprintln!("[EMU] Initializing peripherals...");
     for (idx, pc) in config.peripherals.iter().enumerate() {
@@ -389,22 +477,41 @@ fn run_machine<C: CpuCore>(
             GuiPeripheralConfig::St7789 { width, height, spi_base, cs, dc, res } => {
                 eprintln!("[EMU]   [{}] ST7789 {}x{} SPI base 0x{:08x}", idx, width, height, spi_base);
                 eprintln!("[EMU]        CS: P{}{}, DC: P{}{}", cs.port, cs.pin, dc.port, dc.pin);
-                peripherals.push(Box::new(St7789::new(
+                let device = St7789::new(
                     *width, *height, *spi_base,
                     cs.clone(), dc.clone(), res.clone(),
                     String::new(), false, true, // preview_enabled=true for debugging
-                )));
-                if display_size.is_none() {
-                    display_size = Some((*width, *height));
-                }
+                );
+                let cs_port = cs.port.chars().next().unwrap_or('A').to_ascii_uppercase();
+                let dc_port = dc.port.chars().next().unwrap_or('A').to_ascii_uppercase();
+                // Find which SPI peripheral by scanning target for SPI at spi_base
+                let spi_peripheral = target.peripherals.iter()
+                    .find(|p| p.base_address == *spi_base)
+                    .map(|p| p.name.to_ascii_uppercase())
+                    .unwrap_or_else(|| format!("SPI{}", spi_base & 0xFFFF));
+                eprintln!("[EMU]        → {} (bus-device routing)", spi_peripheral);
+                st7789_handles.push(St7789BusHandle {
+                    spi_peripheral,
+                    cs_port,
+                    cs_pin: cs.pin,
+                    dc_port,
+                    dc_pin: dc.pin,
+                    device,
+                });
             }
             GuiPeripheralConfig::Led { id, pin, active_low } => {
                 eprintln!("[EMU]   [{}] LED {} on P{}{} (active_low={})", idx, id, pin.port, pin.pin, active_low);
-                let short_peripheral = pin.port.trim().to_ascii_uppercase();
-                led_trackers.push(LedTracker {
+                let port = pin.port.chars().next().unwrap_or('A').to_ascii_uppercase();
+                // Register LED with GpioNotifier for GPIO dispatch
+                let led = Led::new(id.clone(), pin.clone(), *active_low);
+                gpio_notifier.register(
+                    GpioPin::new(port, pin.pin),
+                    Box::new(led),
+                );
+                // Also keep a handle for Tauri event emission
+                led_handles.push(LedHandle {
                     id: id.clone(),
-                    gpio_peripheral: format!("GPIO{short_peripheral}"),
-                    short_peripheral,
+                    port,
                     pin: pin.pin,
                     active_low: *active_low,
                     level_high: true,
@@ -418,9 +525,31 @@ fn run_machine<C: CpuCore>(
             GuiPeripheralConfig::Button { id, pin } => {
                 eprintln!("[EMU]   [{}] Button {} on P{}{}", idx, id, pin.port, pin.pin);
             }
+            GuiPeripheralConfig::Ssd1306I2c {
+                width,
+                height,
+                i2c,
+                address,
+            } => {
+                let (w, h) = normalize_ssd1306_size(*width, *height);
+                eprintln!(
+                    "[EMU]   [{}] SSD1306(I2C) {}x{} {} addr=0x{:02x}",
+                    idx, w, h, i2c, address
+                );
+                let i2c_peripheral = i2c.to_ascii_uppercase();
+                let device = Ssd1306I2c::new(w, h, i2c.clone(), *address);
+                ssd1306_handles.push(Ssd1306BusHandle {
+                    i2c_peripheral,
+                    device,
+                    i2c_phase: I2cPhase::Idle,
+                });
+            }
         }
     }
-    eprintln!("[EMU] Peripherals initialized: {} total", peripherals.len() + led_trackers.len() + uart_peripherals.len());
+
+    let has_display = !st7789_handles.is_empty() || !ssd1306_handles.is_empty();
+    eprintln!("[EMU] Peripherals initialized: {} ST7789, {} SSD1306, {} LEDs, {} UARTs",
+        st7789_handles.len(), ssd1306_handles.len(), led_handles.len(), uart_peripherals.len());
 
     // Realtime + UnlockedRender:
     // - CPU loop runs as fast as possible
@@ -433,7 +562,7 @@ fn run_machine<C: CpuCore>(
     let mut wallclock_timers = WallClockTimerDriver::new();
     let mut step_pacer = Some(WallClockStepPacer::new(core_clock_hz, systick_reload_divider));
     let mut step_batch = StepBatchController::new(1_000);
-    let mut can_disable_pacer_for_display = display_size.is_some();
+    let mut can_disable_pacer_for_display = has_display;
     let mut clocks = RccClockModel::new(core_clock_hz, is_f407);
     eprintln!("[EMU] Realtime+UnlockedRender: core={}Hz, systick_div={}", core_clock_hz, systick_reload_divider);
     eprintln!("[EMU] CPU realtime step pacing enabled");
@@ -452,7 +581,7 @@ fn run_machine<C: CpuCore>(
     );
 
     // Throttling: avoid overwhelming frontend/event bridge.
-    let stream_interval = if display_size.is_some() {
+    let stream_interval = if has_display {
         Duration::from_millis(8)
     } else {
         Duration::from_millis(2)
@@ -536,10 +665,12 @@ fn run_machine<C: CpuCore>(
                         &mut machine,
                         &mut serial_cursor,
                         &mut mmio_cursor,
-                        &mut peripherals,
-                        &mut led_trackers,
+                        &mut st7789_handles,
+                        &mut ssd1306_handles,
+                        &mut gpio_notifier,
+                        &mut led_handles,
                         &uart_peripherals,
-                        display_size,
+                        has_display,
                         &app,
                         &mut clocks,
                         &mut uart_batch,
@@ -618,14 +749,17 @@ fn run_machine<C: CpuCore>(
     }
 }
 
+/// Dispatch events through the bus-device architecture.
 fn process_events<C: CpuCore>(
     machine: &mut Machine<C>,
     serial_cursor: &mut usize,
     mmio_cursor: &mut usize,
-    peripherals: &mut Vec<Box<dyn Peripheral>>,
-    led_trackers: &mut Vec<LedTracker>,
+    st7789_handles: &mut [St7789BusHandle],
+    ssd1306_handles: &mut [Ssd1306BusHandle],
+    gpio_notifier: &mut GpioNotifier,
+    led_handles: &mut [LedHandle],
     uart_peripherals: &[String],
-    display_size: Option<(u16, u16)>,
+    has_display: bool,
     app: &AppHandle,
     clocks: &mut RccClockModel,
     uart_batch: &mut Vec<(String, u8)>,
@@ -634,6 +768,7 @@ fn process_events<C: CpuCore>(
     next_frame_deadline: &mut Instant,
 ) -> EventProcessStats {
     let mut stats = EventProcessStats::default();
+
     // ── Serial / UART output (batched) ───────────────────────────────────
     let serial = machine.serial_output();
     stats.serial_events = serial.len().saturating_sub(*serial_cursor);
@@ -641,9 +776,6 @@ fn process_events<C: CpuCore>(
         let is_tracked = uart_peripherals.is_empty()
             || uart_peripherals.iter().any(|u| u.eq_ignore_ascii_case(&event.peripheral));
         if is_tracked {
-            // Filter out ANSI escape sequences (simple heuristic)
-            // ANSI codes start with ESC (0x1B) followed by '['
-            // We'll strip them on the frontend side for now
             uart_batch.push((event.peripheral.clone(), event.byte));
         }
     }
@@ -656,36 +788,111 @@ fn process_events<C: CpuCore>(
         }
     }
 
-    // ── MMIO write events ────────────────────────────────────────────────
+    // ── MMIO write events → bus routing ─────────────────────────────────
     let mmio = machine.mmio_writes();
     stats.mmio_events = mmio.len().saturating_sub(*mmio_cursor);
     for event in &mmio[*mmio_cursor..] {
-        let is_gpio_event = event.peripheral.starts_with("GPIO") || event.peripheral.len() == 1;
-        if display_size.is_some()
-            && event.peripheral.starts_with("SPI")
-            && event.register.eq_ignore_ascii_case("DR")
-        {
+        let is_gpio = event.peripheral.starts_with("GPIO")
+            || (event.peripheral.len() == 1 && event.peripheral.chars().next().unwrap_or('\0').is_ascii_alphabetic());
+        let is_spi_dr = event.peripheral.starts_with("SPI")
+            && event.register.eq_ignore_ascii_case("DR");
+        let is_i2c_dr = event.peripheral.starts_with("I2C")
+            && event.register.eq_ignore_ascii_case("DR");
+        let is_i2c_cr1 = event.peripheral.starts_with("I2C")
+            && event.register.eq_ignore_ascii_case("CR1");
+
+        // Track display activity for pacer decision
+        if has_display && (is_spi_dr || is_i2c_dr) {
             stats.display_activity = true;
         }
-        // Dispatch to peripherals (e.g., St7789 SPI decoder)
-        for p in peripherals.iter_mut() {
-            p.on_mmio_write(machine, event);
+
+        // Route SPI DR → ST7789 SpiSlave::transfer()
+        if is_spi_dr {
+            for handle in st7789_handles.iter_mut() {
+                if event.peripheral.eq_ignore_ascii_case(&handle.spi_peripheral) {
+                    let byte = (event.value & 0xFF) as u8;
+                    let _miso = SpiSlave::transfer(&mut handle.device, byte);
+                }
+            }
         }
+
+        // Route I2C CR1/DR → SSD1306 I2C protocol state machine
+        if is_i2c_cr1 {
+            for handle in ssd1306_handles.iter_mut() {
+                if event.peripheral.eq_ignore_ascii_case(&handle.i2c_peripheral) {
+                    handle.on_cr1_write(event.value);
+                }
+            }
+        }
+        if is_i2c_dr {
+            for handle in ssd1306_handles.iter_mut() {
+                if event.peripheral.eq_ignore_ascii_case(&handle.i2c_peripheral) {
+                    let byte = (event.value & 0xFF) as u8;
+                    handle.on_dr_write(byte);
+                }
+            }
+        }
+
+        // Route GPIO → GpioNotifier (LEDs via trait) + ST7789 CS/DC pins
+        if is_gpio {
+            let port = gpio_port_letter(&event.peripheral).unwrap_or('A');
+            if event.register.eq_ignore_ascii_case("ODR") {
+                let val16 = (event.value & 0xFFFF) as u16;
+                // Dispatch to GpioNotifier (LEDs)
+                gpio_notifier.notify_mask_diff(port, 0, val16);
+                // Dispatch to ST7789 CS/DC pins
+                for handle in st7789_handles.iter_mut() {
+                    if port == handle.cs_port {
+                        let high = ((event.value >> handle.cs_pin) & 1) != 0;
+                        handle.device.chip_select(!high); // CS is active-low: pin LOW = selected
+                    }
+                    if port == handle.dc_port {
+                        let high = ((event.value >> handle.dc_pin) & 1) != 0;
+                        GpioListener::pin_changed(&mut handle.device, port, handle.dc_pin, high);
+                    }
+                }
+            } else if event.register.eq_ignore_ascii_case("BSRR") {
+                let set_mask = event.value & 0xFFFF;
+                let rst_mask = (event.value >> 16) & 0xFFFF;
+                // Dispatch individual pin changes to GpioNotifier
+                for pin in 0..16u8 {
+                    if (set_mask >> pin) & 1 != 0 {
+                        gpio_notifier.notify(port, pin, true);
+                    }
+                    if (rst_mask >> pin) & 1 != 0 {
+                        gpio_notifier.notify(port, pin, false);
+                    }
+                }
+                // Dispatch to ST7789 CS/DC pins
+                for handle in st7789_handles.iter_mut() {
+                    let cs_set = (set_mask >> handle.cs_pin) & 1 != 0;
+                    let cs_rst = (rst_mask >> handle.cs_pin) & 1 != 0;
+                    // CS is active-low: BSRR set → pin HIGH → NOT selected; reset → pin LOW → selected
+                    if cs_set { handle.device.chip_select(false); }
+                    if cs_rst { handle.device.chip_select(true); }
+
+                    let dc_set = (set_mask >> handle.dc_pin) & 1 != 0;
+                    let dc_rst = (rst_mask >> handle.dc_pin) & 1 != 0;
+                    if dc_set { GpioListener::pin_changed(&mut handle.device, port, handle.dc_pin, true); }
+                    if dc_rst { GpioListener::pin_changed(&mut handle.device, port, handle.dc_pin, false); }
+                }
+            }
+            // Update LED handles for Tauri event emission
+            for led in led_handles.iter_mut() {
+                if let Some(on) = led.process_mmio(event) {
+                    app.emit("led-changed", LedChangedPayload {
+                        id: led.id.clone(),
+                        on,
+                    }).ok();
+                }
+            }
+        }
+
+        // RCC/STK clock model
         if event.peripheral.eq_ignore_ascii_case("RCC")
             || event.peripheral.eq_ignore_ascii_case("STK")
         {
             let _ = clocks.apply_mmio(event);
-        }
-        // Update LED state trackers
-        if is_gpio_event {
-            for led in led_trackers.iter_mut() {
-                if led.process_mmio(event) {
-                    app.emit("led-changed", LedChangedPayload {
-                        id: led.id.clone(),
-                        on: led.on_state(),
-                    }).ok();
-                }
-            }
         }
     }
     *mmio_cursor = mmio.len();
@@ -693,33 +900,37 @@ fn process_events<C: CpuCore>(
     // ── Display frame (wall-clock throttled, render unlocked from step count) ──
     if Instant::now() >= *next_frame_deadline {
         *next_frame_deadline = Instant::now() + frame_interval;
-        if let Some((w, h)) = display_size {
-            for p in peripherals.iter_mut() {
-                if let Some(st) = p.as_any_mut().downcast_mut::<St7789>() {
-                    if let Some(frame) = st.latest_frame() {
-                        stats.frame_emitted = true;
-                        let frame_encode_begin = Instant::now();
-                        let data = if cfg!(target_endian = "little") {
-                            // ARGB u32 pixels are already little-endian in memory on all
-                            // supported host targets (x86_64/aarch64), so encode in-place.
-                            let raw = unsafe {
-                                std::slice::from_raw_parts(
-                                    frame.as_ptr() as *const u8,
-                                    frame.len() * std::mem::size_of::<u32>(),
-                                )
-                            };
-                            base64::engine::general_purpose::STANDARD.encode(raw)
-                        } else {
-                            let raw: Vec<u8> = frame.iter()
-                                .flat_map(|&px| px.to_le_bytes())
-                                .collect();
-                            base64::engine::general_purpose::STANDARD.encode(&raw)
-                        };
-                        stats.frame_encode_ns = stats
-                            .frame_encode_ns
-                            .saturating_add(frame_encode_begin.elapsed().as_nanos());
-                        app.emit("display-frame", DisplayFramePayload { width: w, height: h, data }).ok();
-                    }
+        if has_display {
+            // ST7789 displays
+            for handle in st7789_handles.iter_mut() {
+                if let Some(frame) = handle.device.latest_frame() {
+                    stats.frame_emitted = true;
+                    let frame_encode_begin = Instant::now();
+                    let data = encode_argb_frame_base64(&frame);
+                    stats.frame_encode_ns = stats
+                        .frame_encode_ns
+                        .saturating_add(frame_encode_begin.elapsed().as_nanos());
+                    app.emit("display-frame", DisplayFramePayload {
+                        width: handle.device.width(),
+                        height: handle.device.height(),
+                        data,
+                    }).ok();
+                }
+            }
+            // SSD1306 displays
+            for handle in ssd1306_handles.iter_mut() {
+                if let Some(frame) = handle.device.latest_frame() {
+                    stats.frame_emitted = true;
+                    let frame_encode_begin = Instant::now();
+                    let data = encode_argb_frame_base64(&frame);
+                    stats.frame_encode_ns = stats
+                        .frame_encode_ns
+                        .saturating_add(frame_encode_begin.elapsed().as_nanos());
+                    app.emit("display-frame", DisplayFramePayload {
+                        width: handle.device.width(),
+                        height: handle.device.height(),
+                        data,
+                    }).ok();
                 }
             }
         }
@@ -730,4 +941,20 @@ fn process_events<C: CpuCore>(
     *mmio_cursor = 0;
 
     stats
+}
+
+fn encode_argb_frame_base64(frame: &[u32]) -> String {
+    if cfg!(target_endian = "little") {
+        // ARGB u32 pixels are already little-endian in memory on all
+        // supported host targets (x86_64/aarch64), so encode in-place.
+        let raw = unsafe {
+            std::slice::from_raw_parts(
+                frame.as_ptr() as *const u8,
+                std::mem::size_of_val(frame),
+            )
+        };
+        return base64::engine::general_purpose::STANDARD.encode(raw);
+    }
+    let raw: Vec<u8> = frame.iter().flat_map(|&px| px.to_le_bytes()).collect();
+    base64::engine::general_purpose::STANDARD.encode(&raw)
 }

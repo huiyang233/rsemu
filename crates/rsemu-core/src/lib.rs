@@ -7,14 +7,12 @@ pub mod target;
 
 pub use bus::irq::{IrqCallback, IrqSource};
 pub use bus::traits::{
-    AnalogSink, AnalogSource, CanNode, GpioListener, I2cSlave, ParallelDevice, SpiSlave,
-    SystemBus, UartDevice, UsbDevice,
+    GpioListener, I2cSlave, ParallelDevice, SpiSlave, SystemBus, UartDevice,
 };
 pub use bus::{
-    AccessWidth, AdcPeripheral, BusAttach, CanFrame, DacPeripheral, DeviceCapabilities,
-    DeviceHandle, DeviceRegistry, DmaController, DmaDataWidth, DmaDirection, DmaStreamConfig,
-    DmaTransfer, FixedAnalogSource, FsmcBus, GpioNotifier, GpioPin, I2cBus, NoiseAnalogSource,
-    SineAnalogSource, SpiBus, UartBus,
+    AccessWidth, AdcPeripheral, CanFrame, DacPeripheral, DmaController, DmaDataWidth,
+    DmaDirection, DmaStreamConfig, DmaTransfer, FixedAnalogSource, FsmcBus, GpioNotifier,
+    GpioPin, I2cBus, NoiseAnalogSource, SineAnalogSource, SpiBus, UartBus,
 };
 pub use cpu::{ArchitectureId, CpuArchitecture, CpuCore};
 pub use image::{FirmwareFormat, FirmwareLoader};

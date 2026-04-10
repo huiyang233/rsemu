@@ -1,10 +1,9 @@
 use rsemu_core::{
-    AccessWidth, BusAttach, DeviceCapabilities, DeviceHandle, GpioListener, ParallelDevice,
-    SpiSlave, MachineBusInterface, MmioWriteEvent,
+    AccessWidth, GpioListener, ParallelDevice, SpiSlave,
 };
 use tracing::info;
 use std::fs;
-use crate::{Peripheral, PinMapping};
+use crate::PinMapping;
 
 // ---------------------------------------------------------------------------
 // St7789Core — single source of truth for all display state
@@ -264,11 +263,12 @@ impl SpiSlave for St7789 {
 
 impl GpioListener for St7789 {
     fn pin_changed(&mut self, port: char, pin: u8, high: bool) {
-        if port.to_uppercase().to_string() == self.cs.port && pin == self.cs.pin {
-            self.core.cs_active = high;
+        let port_upper = port.to_ascii_uppercase();
+        if port_upper.to_string() == self.cs.port.to_ascii_uppercase() && pin == self.cs.pin {
+            self.core.cs_active = !high; // CS is active-low: pin LOW = selected
         }
-        if port.to_uppercase().to_string() == self.dc.port && pin == self.dc.pin {
-            self.core.dc = high;
+        if port_upper.to_string() == self.dc.port.to_ascii_uppercase() && pin == self.dc.pin {
+            self.core.dc = high; // DC is active-high: pin HIGH = data mode
         }
     }
 }
@@ -302,95 +302,7 @@ impl ParallelDevice for St7789 {
 }
 
 // ---------------------------------------------------------------------------
-// BusAttach implementation — declares SPI_SLAVE + PARALLEL + GPIO_LISTENER
-// ---------------------------------------------------------------------------
-
-impl BusAttach for St7789 {
-    fn as_spi_slave(&mut self) -> Option<&mut dyn SpiSlave> {
-        Some(self)
-    }
-    fn as_parallel(&mut self) -> Option<&mut dyn ParallelDevice> {
-        Some(self)
-    }
-    fn as_gpio_listener(&mut self) -> Option<&mut dyn GpioListener> {
-        Some(self)
-    }
-}
-
-/// Create a DeviceHandle for St7789 with its capabilities declared.
-impl St7789 {
-    pub fn into_device_handle(self) -> DeviceHandle {
-        DeviceHandle::new(
-            DeviceCapabilities::SPI_SLAVE
-                | DeviceCapabilities::PARALLEL
-                | DeviceCapabilities::GPIO_LISTENER,
-            Box::new(self),
-        )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Legacy Peripheral trait — still supported for backward compatibility
-// ---------------------------------------------------------------------------
-
-impl Peripheral for St7789 {
-    fn name(&self) -> &str {
-        "ST7789"
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-
-    fn on_mmio_write(&mut self, _machine: &dyn MachineBusInterface, event: &MmioWriteEvent) {
-        // Track GPIO state for CS/DC (legacy path)
-        if event.peripheral.ends_with(&self.cs.port) || event.peripheral == self.cs.port {
-            if event.register.eq_ignore_ascii_case("ODR") {
-                let high = ((event.value >> self.cs.pin) & 1) != 0;
-                self.core.cs_active = high;
-            } else if event.register.eq_ignore_ascii_case("BSRR") {
-                let set = (event.value >> self.cs.pin) & 1;
-                let reset = (event.value >> (self.cs.pin + 16)) & 1;
-                if reset != 0 {
-                    self.core.cs_active = false;
-                } else if set != 0 {
-                    self.core.cs_active = true;
-                }
-            }
-        }
-        if event.peripheral.ends_with(&self.dc.port) || event.peripheral == self.dc.port {
-            if event.register.eq_ignore_ascii_case("ODR") {
-                let high = ((event.value >> self.dc.pin) & 1) != 0;
-                self.core.dc = high;
-            } else if event.register.eq_ignore_ascii_case("BSRR") {
-                let set = (event.value >> self.dc.pin) & 1;
-                let reset = (event.value >> (self.dc.pin + 16)) & 1;
-                if reset != 0 {
-                    self.core.dc = false;
-                } else if set != 0 {
-                    self.core.dc = true;
-                }
-            }
-        }
-
-        // Process SPI data
-        if event.peripheral.starts_with("SPI") && event.register.eq_ignore_ascii_case("DR") {
-            let byte = (event.value & 0xFF) as u8;
-            if self.core.cs_active {
-                return;
-            }
-            if self.core.dc {
-                self.core.write_data(byte);
-            } else {
-                info!("st7789.cmd_write 0x{:02x}", byte);
-                self.core.write_command(byte);
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
+// ParallelDevice implementation — for FSMC bus (e.g., ST7789 via FSMC on F407)
 // ---------------------------------------------------------------------------
 
 fn rgb565_to_rgb888(p: u16) -> [u8; 3] {

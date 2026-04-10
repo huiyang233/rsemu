@@ -1,6 +1,4 @@
-use rsemu_core::{MachineBusInterface, MmioWriteEvent};
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
 
 pub mod display;
 pub mod led;
@@ -55,11 +53,4 @@ fn default_true() -> bool {
 
 fn default_ssd1306_addr() -> u8 {
     0x3c
-}
-
-pub trait Peripheral: Send + Debug {
-    fn name(&self) -> &str;
-    fn on_mmio_write(&mut self, machine: &dyn MachineBusInterface, event: &MmioWriteEvent);
-    fn update(&mut self, _machine: &dyn MachineBusInterface) {}
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }

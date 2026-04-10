@@ -1,8 +1,4 @@
-use rsemu_core::{
-    BusAttach, DeviceCapabilities, DeviceHandle, I2cSlave,
-    MachineBusInterface, MmioWriteEvent,
-};
-use crate::Peripheral;
+use rsemu_core::I2cSlave;
 
 // ---------------------------------------------------------------------------
 // SSD1306 Core — single source of truth for all display state
@@ -244,15 +240,13 @@ impl Ssd1306Core {
 pub struct Ssd1306I2c {
     core: Ssd1306Core,
     address: u8,
-    i2c_peripheral: String,
 }
 
 impl Ssd1306I2c {
-    pub fn new(width: u16, height: u16, i2c_peripheral: String, address: u8) -> Self {
+    pub fn new(width: u16, height: u16, _i2c_peripheral: String, address: u8) -> Self {
         Self {
             core: Ssd1306Core::new(width, height),
             address: address & 0x7f,
-            i2c_peripheral: i2c_peripheral.to_ascii_uppercase(),
         }
     }
 
@@ -266,13 +260,6 @@ impl Ssd1306I2c {
 
     pub fn latest_frame(&mut self) -> Option<Vec<u32>> {
         self.core.latest_frame()
-    }
-
-    pub fn into_device_handle(self) -> DeviceHandle {
-        DeviceHandle::new(
-            DeviceCapabilities::I2C_SLAVE,
-            Box::new(self),
-        )
     }
 }
 
@@ -330,84 +317,6 @@ impl I2cSlave for Ssd1306I2c {
         self.core.stream_kind = None;
         self.core.pending_cmd = None;
         self.core.pending_left = 0;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// BusAttach implementation
-// ---------------------------------------------------------------------------
-
-impl BusAttach for Ssd1306I2c {
-    fn as_i2c_slave(&mut self) -> Option<&mut dyn I2cSlave> {
-        Some(self)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Legacy Peripheral trait — backward compatible
-// ---------------------------------------------------------------------------
-
-impl Peripheral for Ssd1306I2c {
-    fn name(&self) -> &str {
-        "SSD1306_I2C"
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-
-    fn on_mmio_write(&mut self, _machine: &dyn MachineBusInterface, event: &MmioWriteEvent) {
-        if !event.peripheral.eq_ignore_ascii_case(&self.i2c_peripheral) {
-            return;
-        }
-        if event.register.eq_ignore_ascii_case("CR1") {
-            // START
-            if (event.value & (1 << 8)) != 0 {
-                // Phase enters AwaitAddress; handled by I2cBus normally,
-                // but for legacy path we reset state here.
-                self.core.stream_kind = None;
-                self.core.pending_cmd = None;
-                self.core.pending_left = 0;
-                self.core.pending_filled = 0;
-            }
-            // STOP
-            if (event.value & (1 << 9)) != 0 {
-                self.core.snapshot_if_empty();
-                self.core.stream_kind = None;
-                self.core.pending_cmd = None;
-                self.core.pending_left = 0;
-                self.core.pending_filled = 0;
-            }
-        } else if event.register.eq_ignore_ascii_case("DR") {
-            let byte = (event.value & 0xFF) as u8;
-            // Legacy path: handle full I2C protocol inline
-            // (This matches the original on_dr_write behavior)
-            if self.core.stream_kind.is_none() && self.core.pending_cmd.is_none() {
-                // Treat as address byte first
-                let addr = byte >> 1;
-                if addr == self.address {
-                    self.core.stream_kind = None;
-                    return;
-                }
-            }
-            if self.core.stream_kind.is_none() {
-                // Control byte
-                self.core.stream_kind = if (byte & 0x40) != 0 {
-                    Some(StreamKind::Data)
-                } else {
-                    Some(StreamKind::Command)
-                };
-                self.core.pending_cmd = None;
-                self.core.pending_left = 0;
-                self.core.pending_filled = 0;
-                return;
-            }
-            match self.core.stream_kind {
-                Some(StreamKind::Command) => self.core.write_command(byte),
-                Some(StreamKind::Data) => self.core.write_data(byte),
-                None => {}
-            }
-        }
     }
 }
 
