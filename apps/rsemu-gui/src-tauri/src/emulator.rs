@@ -1,12 +1,9 @@
 use base64::Engine;
 use rsemu_core::cpu::armv7em::CortexM4;
 use rsemu_core::cpu::armv7m::CortexM3;
+use rsemu_core::TargetSpec;
 use tauri::Emitter;
 use std::time::{Duration, Instant};
-
-// Bundled SVD files — embedded at compile time so the user never needs to supply them.
-const SVD_F103: &str = include_str!("../svd/stm32f103.svd");
-const SVD_F407: &str = include_str!("../svd/stm32f407.svd");
 
 struct WallClockSystickDriver {
     last: Instant,
@@ -113,13 +110,12 @@ fn normalize_ssd1306_size(width: u16, height: u16) -> (u16, u16) {
 
 use rsemu_core::{
     BusContext, CpuCore, CpuType, FirmwareLoader, GpioPin, I2cBus, Machine,
-    RccClockModel, SpiBus, StepBatchController, TargetSpec, gpio_idr_addr,
+    RccClockModel, SpiBus, StepBatchController, gpio_idr_addr,
 };
 use rsemu_peripherals::display::St7789;
 use rsemu_peripherals::led::Led;
 use rsemu_peripherals::ssd1306::Ssd1306I2c;
 use rsemu_peripherals::{PeripheralConfig, PinMapping};
-use rsemu_targets::stm32::{f103, f407};
 use serde::Serialize;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use tauri::AppHandle;
@@ -166,7 +162,7 @@ struct EventProcessStats {
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
-pub fn run_emulator(config: SimConfig, app: AppHandle, control_rx: Receiver<ControlMsg>) {
+pub fn run_emulator(target: TargetSpec, config: SimConfig, app: AppHandle, control_rx: Receiver<ControlMsg>) {
     eprintln!("[EMU] Starting emulator for board: {}", config.board);
     eprintln!("[EMU] Firmware: {}", config.firmware_path);
     eprintln!("[EMU] Peripherals: {} items", config.peripherals.len());
@@ -174,22 +170,7 @@ pub fn run_emulator(config: SimConfig, app: AppHandle, control_rx: Receiver<Cont
         eprintln!("[EMU]   [{}] {:?}", i, p);
     }
 
-    let is_f407_board = config.board == "stm32f407";
-    let target = match if is_f407_board {
-        f407::load_target(Some(SVD_F407))
-    } else {
-        f103::load_target(Some(SVD_F103))
-    } {
-        Ok(t) => {
-            eprintln!("[EMU] Target loaded: {} ({} peripherals)", t.name, t.peripherals.len());
-            t
-        }
-        Err(e) => {
-            eprintln!("[EMU] ERROR loading target: {}", e);
-            app.emit("sim-status", SimStatusPayload { steps: 0, running: false, error: Some(e.clone()) }).ok();
-            return;
-        }
-    };
+    eprintln!("[EMU] Target loaded: {} ({} peripherals)", target.name, target.peripherals.len());
 
     let peripherals = target.peripherals.clone();
     match target.cpu_type {

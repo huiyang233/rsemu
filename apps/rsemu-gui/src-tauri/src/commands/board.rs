@@ -1,9 +1,7 @@
 use rsemu_core::target::{MemoryRegionKind, TargetSpec};
-use rsemu_targets::stm32::{f103, f407};
+use rsemu_targets::TargetRegistry;
 use serde::Serialize;
-
-const SVD_F103: &str = include_str!("../../svd/stm32f103.svd");
-const SVD_F407: &str = include_str!("../../svd/stm32f407.svd");
+use tauri::State;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BoardInfo {
@@ -26,19 +24,14 @@ pub struct BusPeripheralInfo {
 }
 
 #[tauri::command]
-pub fn get_boards() -> Vec<BoardInfo> {
-    let targets: Vec<(&str, &str, Result<TargetSpec, String>)> = vec![
-        ("stm32f103", "STM32F103 (Cortex-M3)", f103::load_target(Some(SVD_F103))),
-        ("stm32f407", "STM32F407 (Cortex-M4)", f407::load_target(Some(SVD_F407))),
-    ];
-
-    targets
-        .into_iter()
-        .filter_map(|(id, name, result)| {
-            let target = result.ok()?;
-            Some(board_info_from_target(id, name, &target))
-        })
-        .collect()
+pub fn get_boards(registry: State<'_, TargetRegistry>) -> Result<Vec<BoardInfo>, String> {
+    let mut boards = Vec::new();
+    for id in registry.list_ids() {
+        let config = registry.get_config(id).unwrap();
+        let target = registry.load(id)?;
+        boards.push(board_info_from_target(id, &config.name, &target));
+    }
+    Ok(boards)
 }
 
 fn board_info_from_target(id: &str, name: &str, target: &TargetSpec) -> BoardInfo {

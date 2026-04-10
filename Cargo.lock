@@ -3020,6 +3020,8 @@ dependencies = [
  "log",
  "rsemu-core",
  "rsemu-svd",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

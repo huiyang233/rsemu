@@ -9,7 +9,7 @@ use rsemu_core::{
 use rsemu_peripherals::display::St7789;
 use rsemu_peripherals::led::Led;
 use rsemu_peripherals::{PeripheralConfig, PinMapping};
-use rsemu_targets::stm32::{f103, f407};
+use rsemu_targets::TargetRegistry;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -23,15 +23,21 @@ use tracing::{debug, info};
 pub fn run() -> Result<(), String> {
     let args = CliArgs::parse()?;
     let board = load_board_config(&args.board_path)?;
-    let svd_xml = read_optional_string(resolve_path(
-        &args.board_path,
-        board.svd.as_deref(),
-    ))?;
 
-    let mut target = match board.target.as_deref() {
-        Some("STM32F407") | Some("f407") | Some("stm32f407") => f407::load_target(svd_xml.as_deref())?,
-        _ => f103::load_target(svd_xml.as_deref())?,
-    };
+    // Resolve configs/ and svds/ dirs relative to the board.toml or project root
+    let board_dir = Path::new(&args.board_path)
+        .parent()
+        .unwrap_or(Path::new("."));
+    let configs_dir = board_dir.join("configs");
+    let svds_dir = board_dir.join("svds");
+    let registry = TargetRegistry::from_dirs(&configs_dir, &svds_dir)?;
+
+    let target_id = board
+        .target
+        .as_deref()
+        .unwrap_or("stm32f103")
+        .to_ascii_lowercase();
+    let mut target = registry.load(&target_id)?;
 
     if let Some(addr) = board.load_addr {
         target.vector_table_base = addr as u64;
@@ -54,7 +60,6 @@ pub fn run() -> Result<(), String> {
 #[derive(Debug, Deserialize)]
 struct BoardConfig {
     target: Option<String>,
-    svd: Option<String>,
     firmware: Option<String>,
     load_addr: Option<u32>,
     cycle_scale: Option<u32>,
@@ -83,14 +88,6 @@ fn resolve_path(board_path: &str, maybe_rel: Option<&str>) -> Option<String> {
     let board_dir = Path::new(board_path).parent().unwrap_or_else(|| Path::new("."));
     let abs: PathBuf = board_dir.join(value_path);
     Some(abs.to_string_lossy().into_owned())
-}
-
-fn read_optional_string(path: Option<String>) -> Result<Option<String>, String> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    let content = fs::read_to_string(&path).map_err(|e| format!("failed to read file {path}: {e}"))?;
-    Ok(Some(content))
 }
 
 fn run_with_cpu<C: CpuCore>(

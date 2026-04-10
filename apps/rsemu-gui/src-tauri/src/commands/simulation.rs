@@ -3,13 +3,17 @@ use tauri::{AppHandle, State};
 
 use crate::emulator::run_emulator;
 use crate::state::{ControlMsg, SimConfig, SimState};
+use rsemu_targets::TargetRegistry;
 
 #[tauri::command]
 pub async fn start_simulation(
     app: AppHandle,
     state: State<'_, Mutex<SimState>>,
+    registry: State<'_, TargetRegistry>,
     config: SimConfig,
 ) -> Result<(), String> {
+    let target = registry.load(&config.board)?;
+
     let mut guard = state.lock().map_err(|e| e.to_string())?;
 
     // Stop any previously running simulation
@@ -25,7 +29,7 @@ pub async fn start_simulation(
 
     let app_clone = app.clone();
     let handle = std::thread::spawn(move || {
-        run_emulator(config, app_clone, rx);
+        run_emulator(target, config, app_clone, rx);
     });
     guard.thread = Some(handle);
 
