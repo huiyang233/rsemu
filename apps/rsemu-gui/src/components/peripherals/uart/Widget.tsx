@@ -69,7 +69,7 @@ export default function UartTerminal({ config, onClear }: Props) {
   useEffect(() => {
     const unsub = uartOutputBus.subscribe((p) => {
       if (p.peripheral.toUpperCase() === config.usart.toUpperCase() && termRef.current) {
-        termRef.current.write(String.fromCharCode(p.byte));
+        termRef.current.write(Uint8Array.from(p.bytes));
       }
     });
     return unsub;

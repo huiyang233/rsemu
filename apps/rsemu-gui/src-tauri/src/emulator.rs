@@ -148,7 +148,7 @@ struct DisplayFramePayload {
 #[derive(Clone, Serialize)]
 struct UartOutputPayload {
     peripheral: String,
-    byte: u8,
+    bytes: Vec<u8>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -173,9 +173,17 @@ pub fn run_emulator(target: TargetSpec, config: SimConfig, app: AppHandle, contr
     eprintln!("[EMU] Target loaded: {} ({} peripherals)", target.name, target.peripherals.len());
 
     let peripherals = target.peripherals.clone();
-    match target.cpu_type {
-        CpuType::CortexM4 => run_machine(CortexM4::new(), target, config, app, control_rx, &peripherals),
-        CpuType::CortexM3 => run_machine(CortexM3::new(), target, config, app, control_rx, &peripherals),
+    let cpu_init_result = match target.cpu_type {
+        CpuType::CortexM4 => CortexM4::new().map(|cpu| {
+            run_machine(cpu, target, config, app.clone(), control_rx, &peripherals);
+        }),
+        CpuType::CortexM3 => CortexM3::new().map(|cpu| {
+            run_machine(cpu, target, config, app.clone(), control_rx, &peripherals);
+        }),
+    };
+    if let Err(e) = cpu_init_result {
+        eprintln!("[EMU] ERROR initializing CPU: {e}");
+        app.emit("sim-status", SimStatusPayload { steps: 0, running: false, error: Some(e) }).ok();
     }
 }
 
@@ -375,23 +383,28 @@ fn run_machine<C: CpuCore>(
         loop {
             match control_rx.try_recv() {
                 Ok(ControlMsg::Stop) | Err(TryRecvError::Disconnected) => {
+                    flush_uart_batch(&app, &mut uart_batch);
                     app.emit("sim-status", SimStatusPayload { steps, running: false, error: None }).ok();
                     return;
                 }
                 Ok(ControlMsg::InjectGpio { port, pin, high }) => {
                     if let Some(ch) = port.chars().next() {
-                        let addr = gpio_idr_addr(ch, target_peripherals);
-                        let b0 = machine.read8(addr).unwrap_or(0);
-                        let b1 = machine.read8(addr + 1).unwrap_or(0);
-                        let b2 = machine.read8(addr + 2).unwrap_or(0);
-                        let b3 = machine.read8(addr + 3).unwrap_or(0);
-                        let mut idr = u32::from_le_bytes([b0, b1, b2, b3]);
-                        if high { idr |= 1u32 << pin; } else { idr &= !(1u32 << pin); }
-                        let bytes = idr.to_le_bytes();
-                        let _ = machine.write8(addr, bytes[0]);
-                        let _ = machine.write8(addr + 1, bytes[1]);
-                        let _ = machine.write8(addr + 2, bytes[2]);
-                        let _ = machine.write8(addr + 3, bytes[3]);
+                        match gpio_idr_addr(ch, target_peripherals) {
+                            Ok(addr) => {
+                                let b0 = machine.read8(addr).unwrap_or(0);
+                                let b1 = machine.read8(addr + 1).unwrap_or(0);
+                                let b2 = machine.read8(addr + 2).unwrap_or(0);
+                                let b3 = machine.read8(addr + 3).unwrap_or(0);
+                                let mut idr = u32::from_le_bytes([b0, b1, b2, b3]);
+                                if high { idr |= 1u32 << pin; } else { idr &= !(1u32 << pin); }
+                                let bytes = idr.to_le_bytes();
+                                let _ = machine.write8(addr, bytes[0]);
+                                let _ = machine.write8(addr + 1, bytes[1]);
+                                let _ = machine.write8(addr + 2, bytes[2]);
+                                let _ = machine.write8(addr + 3, bytes[3]);
+                            }
+                            Err(e) => eprintln!("[EMU] InjectGpio: {e}"),
+                        }
                     }
                 }
                 Ok(ControlMsg::SendUart { peripheral, bytes }) => {
@@ -508,6 +521,21 @@ fn run_machine<C: CpuCore>(
     }
 }
 
+fn flush_uart_batch(app: &AppHandle, batch: &mut Vec<(String, u8)>) {
+    if batch.is_empty() {
+        return;
+    }
+    // Group by peripheral and emit one event per peripheral per flush.
+    let mut by_peripheral: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    for (peripheral, byte) in batch.drain(..) {
+        by_peripheral.entry(peripheral).or_default().push(byte);
+    }
+    for (peripheral, bytes) in by_peripheral {
+        app.emit("uart-output", UartOutputPayload { peripheral, bytes }).ok();
+    }
+}
+
 /// Dispatch events through BusContext.
 fn process_events<C: CpuCore>(
     machine: &mut Machine<C>,
@@ -537,11 +565,11 @@ fn process_events<C: CpuCore>(
     }
     *serial_cursor = serial.len();
 
-    // Flush UART batch on size threshold or periodic stream tick.
-    if uart_batch.len() >= uart_batch_size || !uart_batch.is_empty() {
-        for (peripheral, byte) in uart_batch.drain(..) {
-            app.emit("uart-output", UartOutputPayload { peripheral, byte }).ok();
-        }
+    // Flush UART batch only when it reaches the batch size threshold.
+    // The previous `|| !uart_batch.is_empty()` condition was defeating batching
+    // by flushing on every tick regardless of size.
+    if uart_batch.len() >= uart_batch_size {
+        flush_uart_batch(app, uart_batch);
     }
 
     // ── MMIO write events → BusContext routing ──────────────────────────

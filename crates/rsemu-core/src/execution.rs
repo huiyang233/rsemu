@@ -92,17 +92,17 @@ pub fn gpio_port_letter(name: &str) -> Option<char> {
 
 /// Compute the GPIO IDR register address for a given port.
 /// Derives the GPIO base address and IDR register offset from the SVD peripheral list.
-pub fn gpio_idr_addr(port: char, peripherals: &[PeripheralSpec]) -> u64 {
+pub fn gpio_idr_addr(port: char, peripherals: &[PeripheralSpec]) -> Result<u64, String> {
     let idx = port.to_ascii_uppercase() as u64 - b'A' as u64;
     let gpioa = peripherals
         .iter()
         .find(|p| p.name == "GPIOA")
-        .expect("GPIOA not found in target spec");
+        .ok_or_else(|| "GPIOA not found in target spec".to_string())?;
     let idr = gpioa
         .registers
         .iter()
         .find(|r| r.name == "IDR")
-        .expect("IDR register not found in GPIOA");
+        .ok_or_else(|| "IDR register not found in GPIOA".to_string())?;
     let idr_offset = idr.address - gpioa.base_address;
-    gpioa.base_address + idx * 0x400 + idr_offset
+    Ok(gpioa.base_address + idx * 0x400 + idr_offset)
 }

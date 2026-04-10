@@ -50,7 +50,7 @@ interface AppState {
   setLedState: (id: string, on: boolean) => void;
 
   uartOutput: Record<string, string>;
-  appendUartByte: (peripheral: string, byte: number) => void;
+  appendUartBytes: (peripheral: string, bytes: number[]) => void;
   clearUartOutput: (peripheral: string) => void;
 }
 
@@ -134,13 +134,14 @@ export const useAppStore = create<AppState>((set) => ({
     set((s) => ({ ledStates: { ...s.ledStates, [id]: on } })),
 
   uartOutput: {},
-  appendUartByte: (peripheral, byte) =>
-    set((s) => ({
-      uartOutput: {
-        ...s.uartOutput,
-        [peripheral]: (s.uartOutput[peripheral] ?? "") + String.fromCharCode(byte),
-      },
-    })),
+  appendUartBytes: (peripheral, bytes) =>
+    set((s) => {
+      const MAX_UART_LEN = 65536;
+      const prev = s.uartOutput[peripheral] ?? "";
+      const chunk = String.fromCharCode(...bytes);
+      const next = (prev + chunk).slice(-MAX_UART_LEN);
+      return { uartOutput: { ...s.uartOutput, [peripheral]: next } };
+    }),
   clearUartOutput: (peripheral) =>
     set((s) => ({ uartOutput: { ...s.uartOutput, [peripheral]: "" } })),
 }));

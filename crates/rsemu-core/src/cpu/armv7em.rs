@@ -66,16 +66,16 @@ pub struct CortexM4 {
 
 impl Default for CortexM4 {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("failed to create CortexM4")
     }
 }
 
 impl CortexM4 {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, String> {
         let mut uc = Unicorn::new_with_data(Arch::ARM, Mode::THUMB | Mode::MCLASS, UcData::default())
-            .expect("failed to create unicorn ARMv7-M engine");
-        install_hooks(&mut uc).expect("failed to install unicorn hooks");
-        Self {
+            .map_err(|e| format!("failed to create unicorn ARMv7-M engine: {e:?}"))?;
+        install_hooks(&mut uc).map_err(|e| format!("failed to install unicorn hooks: {e}"))?;
+        Ok(Self {
             arch: ArmV7EMArchitecture,
             registers: [0; 16],
             xpsr: 1 << 24,
@@ -87,7 +87,7 @@ impl CortexM4 {
             basepri: 0,
             faultmask: 0,
             uc,
-        }
+        })
     }
 
     pub fn registers(&self) -> &[u32; 16] {

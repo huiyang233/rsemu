@@ -63,16 +63,16 @@ pub struct CortexM3 {
 
 impl Default for CortexM3 {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("failed to create CortexM3")
     }
 }
 
 impl CortexM3 {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, String> {
         let mut uc = Unicorn::new_with_data(Arch::ARM, Mode::THUMB | Mode::MCLASS, UcData::default())
-            .expect("failed to create unicorn ARMv7-M engine");
-        install_hooks(&mut uc).expect("failed to install unicorn hooks");
-        Self {
+            .map_err(|e| format!("failed to create unicorn ARMv7-M engine: {e:?}"))?;
+        install_hooks(&mut uc).map_err(|e| format!("failed to install unicorn hooks: {e}"))?;
+        Ok(Self {
             arch: ArmV7MArchitecture,
             registers: [0; 16],
             xpsr: 1 << 24,
@@ -83,7 +83,7 @@ impl CortexM3 {
             basepri: 0,
             faultmask: 0,
             uc,
-        }
+        })
     }
 
     pub fn registers(&self) -> &[u32; 16] {
@@ -477,12 +477,12 @@ fn map_page_minimal(uc: &mut Unicorn<'_, UcData>, addr: u64) -> Result<(), Strin
     Ok(())
 }
 
-fn read_bus_bytes(bus: &mut dyn SystemBus, addr: u64, size: usize) -> Result<Vec<u8>, String> {
-    let mut bytes = vec![0u8; size];
-    for (i, b) in bytes.iter_mut().enumerate() {
-        *b = bus.read8(addr + i as u64)?;
+fn read_bus_bytes(bus: &mut dyn SystemBus, addr: u64, size: usize) -> Result<[u8; 8], String> {
+    let mut buf = [0u8; 8];
+    for i in 0..size.min(8) {
+        buf[i] = bus.read8(addr + i as u64)?;
     }
-    Ok(bytes)
+    Ok(buf)
 }
 
 fn write_bus_value(bus: &mut dyn SystemBus, addr: u64, size: usize, value: i64) -> Result<(), String> {
@@ -605,7 +605,7 @@ fn install_hooks(uc: &mut Unicorn<'_, UcData>) -> Result<(), String> {
                 return false;
             }
             uc.get_data_mut().suppress_rw_hooks = true;
-            if let Err(err) = uc.mem_write(addr, &bytes) {
+            if let Err(err) = uc.mem_write(addr, &bytes[..size.min(8)]) {
                 uc.get_data_mut().suppress_rw_hooks = false;
                 uc.get_data_mut().last_error =
                     Some(format!("unicorn mem_write in mmio read hook failed @0x{addr:08x}: {err:?}"));

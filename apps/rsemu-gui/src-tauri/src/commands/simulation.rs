@@ -14,16 +14,20 @@ pub async fn start_simulation(
 ) -> Result<(), String> {
     let target = registry.load(&config.board)?;
 
-    let mut guard = state.lock().map_err(|e| e.to_string())?;
-
-    // Stop any previously running simulation
-    if let Some(tx) = guard.control_tx.take() {
+    // Take out old handles before acquiring lock for new thread setup,
+    // so that join() is called outside the lock and cannot deadlock.
+    let (old_tx, old_handle) = {
+        let mut guard = state.lock().map_err(|e| e.to_string())?;
+        (guard.control_tx.take(), guard.thread.take())
+    };
+    if let Some(tx) = old_tx {
         let _ = tx.send(ControlMsg::Stop);
     }
-    if let Some(handle) = guard.thread.take() {
+    if let Some(handle) = old_handle {
         let _ = handle.join();
     }
 
+    let mut guard = state.lock().map_err(|e| e.to_string())?;
     let (tx, rx) = mpsc::channel::<ControlMsg>();
     guard.control_tx = Some(tx);
 

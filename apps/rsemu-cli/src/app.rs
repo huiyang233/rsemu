@@ -47,11 +47,11 @@ pub fn run() -> Result<(), String> {
 
     match target.cpu_type {
         CpuType::CortexM4 => {
-            let machine = Machine::new(CortexM4::new(), target.clone());
+            let machine = Machine::new(CortexM4::new()?, target.clone());
             run_with_cpu(machine, target, &args, &board, firmware_path, cycle_scale)
         }
         CpuType::CortexM3 => {
-            let machine = Machine::new(CortexM3::new(), target.clone());
+            let machine = Machine::new(CortexM3::new()?, target.clone());
             run_with_cpu(machine, target, &args, &board, firmware_path, cycle_scale)
         }
     }

@@ -18,5 +18,5 @@ export interface DisplayFramePayload {
 
 export interface UartOutputPayload {
   peripheral: string;
-  byte: number;
+  bytes: number[];
 }

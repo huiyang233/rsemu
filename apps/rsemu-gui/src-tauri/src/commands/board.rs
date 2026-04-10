@@ -27,7 +27,9 @@ pub struct BusPeripheralInfo {
 pub fn get_boards(registry: State<'_, TargetRegistry>) -> Result<Vec<BoardInfo>, String> {
     let mut boards = Vec::new();
     for id in registry.list_ids() {
-        let config = registry.get_config(id).unwrap();
+        let config = registry
+            .get_config(id)
+            .ok_or_else(|| format!("config not found for id: {id}"))?;
         let target = registry.load(id)?;
         boards.push(board_info_from_target(id, &config.name, &target));
     }
