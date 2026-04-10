@@ -439,6 +439,11 @@ impl CpuCore for CortexM3 {
 
 fn set_uc_bus(data: &mut UcData, bus: &mut dyn SystemBus) {
     let raw = bus as *mut dyn SystemBus;
+    // SAFETY: A `*mut dyn Trait` is a fat pointer (data ptr, vtable ptr), which
+    // has the same layout as `(usize, usize)`. We split it into two `usize` fields
+    // so it can be stored in `UcData` (which has no lifetime parameter). The pointer
+    // remains valid as long as the underlying `MachineBus` reference outlives the
+    // unicorn `emu_start` call — see the lifetimes in `step()` which guarantee this.
     let (ptr, vt): (usize, usize) = unsafe { std::mem::transmute(raw) };
     data.bus_data = ptr;
     data.bus_vtable = vt;
@@ -453,6 +458,10 @@ fn get_uc_bus(data: &UcData) -> Option<*mut dyn SystemBus> {
     if data.bus_data == 0 {
         None
     } else {
+        // SAFETY: Reconstruct the fat pointer from the two `usize` fields stored by
+        // `set_uc_bus`. Valid because `set_uc_bus` was called with a live reference
+        // and the pointer is only dereferenced inside unicorn hooks during `emu_start`,
+        // which is guaranteed to return before the underlying `MachineBus` is dropped.
         Some(unsafe {
             std::mem::transmute::<(usize, usize), *mut dyn SystemBus>((data.bus_data, data.bus_vtable))
         })

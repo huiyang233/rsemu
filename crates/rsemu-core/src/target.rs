@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use crate::cpu::ArchitectureId;
+use crate::cpu::{ArchitectureId, CpuCore};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryRegion {
@@ -57,6 +57,23 @@ pub struct TargetSpec {
     pub systick_reload_divider: u32,
     pub memory_map: Vec<MemoryRegion>,
     pub peripherals: Vec<PeripheralSpec>,
+}
+
+impl CpuType {
+    /// Construct a boxed CPU core for this type.
+    /// Adding a new CPU variant only requires updating this method + the enum.
+    pub fn make_cpu(&self) -> Result<Box<dyn CpuCore>, String> {
+        match self {
+            CpuType::CortexM3 => {
+                let cpu = crate::cpu::armv7m::CortexM3::new()?;
+                Ok(Box::new(cpu))
+            }
+            CpuType::CortexM4 => {
+                let cpu = crate::cpu::armv7em::CortexM4::new()?;
+                Ok(Box::new(cpu))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]

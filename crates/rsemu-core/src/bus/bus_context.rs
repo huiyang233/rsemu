@@ -91,8 +91,9 @@ impl BusContext {
     /// Route a single MMIO write event to the appropriate bus devices.
     pub fn dispatch_mmio(&mut self, event: &MmioWriteEvent) -> BusContextStats {
         let mut stats = BusContextStats::default();
-        let periph = event.peripheral.to_ascii_uppercase();
-        let reg = event.register.to_ascii_uppercase();
+        // Names are pre-uppercased in RegisterMeta at init time, no runtime conversion needed.
+        let periph = &*event.peripheral;
+        let reg = &*event.register;
 
         // ── SPI DR writes ────────────────────────────────────────────
         if periph.starts_with("SPI") && reg == "DR" {
@@ -163,7 +164,7 @@ impl BusContext {
 
     /// Internal: dispatch GPIO ODR/BSRR events.
     fn dispatch_gpio(&mut self, port: char, event: &MmioWriteEvent) {
-        let reg = event.register.to_ascii_uppercase();
+        let reg = &*event.register;
 
         if reg == "ODR" {
             let val16 = (event.value & 0xFFFF) as u16;

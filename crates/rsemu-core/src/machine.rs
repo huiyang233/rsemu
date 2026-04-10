@@ -339,8 +339,8 @@ impl<C: CpuCore> Machine<C> {
                 // Initialise mmio with the reset value; store as word-aligned u32
                 let reset_word = register.reset_value as u32;
                 write_mmio_u32(&mut mmio, register.address, reset_word);
-                let p_arc: Arc<str> = Arc::from(peripheral.name.as_str());
-                let r_arc: Arc<str> = Arc::from(register.name.as_str());
+                let p_arc: Arc<str> = Arc::from(peripheral.name.to_ascii_uppercase());
+                let r_arc: Arc<str> = Arc::from(register.name.to_ascii_uppercase());
                 for index in 0..width {
                     let addr = register.address + index as u64;
                     register_meta.insert(
@@ -929,10 +929,10 @@ impl SystemBus for MachineBus<'_> {
             if let Some(reg) = meta.systick {
                 return Ok(self.systick.read8(reg, meta.byte_offset));
             }
-            if meta.peripheral.eq_ignore_ascii_case("RCC") {
-                if meta.register.eq_ignore_ascii_case("CR")
-                    || meta.register.eq_ignore_ascii_case("CSR")
-                    || meta.register.eq_ignore_ascii_case("BDCR")
+            if &*meta.peripheral == "RCC" {
+                if &*meta.register == "CR"
+                    || &*meta.register == "CSR"
+                    || &*meta.register == "BDCR"
                 {
                     let base_addr = addr & !3;
                     let raw = read_mmio_u32(self.mmio, base_addr);
@@ -1114,10 +1114,10 @@ impl SystemBus for MachineBus<'_> {
             if let Some(reg) = meta.systick {
                 return Ok(self.systick.read32(reg));
             }
-            if meta.peripheral.eq_ignore_ascii_case("RCC") {
-                if meta.register.eq_ignore_ascii_case("CR")
-                    || meta.register.eq_ignore_ascii_case("CSR")
-                    || meta.register.eq_ignore_ascii_case("BDCR")
+            if &*meta.peripheral == "RCC" {
+                if &*meta.register == "CR"
+                    || &*meta.register == "CSR"
+                    || &*meta.register == "BDCR"
                 {
                     let raw = read_mmio_u32(self.mmio, addr);
                     return Ok(apply_rcc_ready_flags(addr, raw, raw));
@@ -1167,7 +1167,7 @@ impl SystemBus for MachineBus<'_> {
             return block.write32(addr, value);
         }
 
-        if write_special_mmio_u32(
+        if write_special_mmio_word(
             self.mmio,
             self.serial_output,
             self.mmio_writes,
@@ -1421,6 +1421,8 @@ fn timer_enable_bit(peripheral: &str, rcc: RccRegs) -> Option<(u64, u8)> {
     }
 }
 
+/// Handle 8-bit special MMIO write by merging into word and delegating to the
+/// unified `write_special_mmio_word`.
 fn write_special_mmio(
     mmio: &mut HashMap<u64, u32>,
     serial_output: &mut Vec<SerialEvent>,
@@ -1430,30 +1432,8 @@ fn write_special_mmio(
     addr: u64,
     value: u8,
 ) -> bool {
+    // SysTick byte writes need byte-level precision (different reg per byte_offset).
     if let Some(meta) = register_meta.get(&addr) {
-        if is_rcc_control(meta) || is_rcc_csr(meta) || is_pwr_csr(meta) {
-            let base_addr = addr & !3;
-            let old_val = read_mmio_u32(mmio, base_addr);
-            let merged = merge_mmio_write(old_val, addr, 1, value as u32);
-            let updated = apply_rcc_ready_flags(base_addr, old_val, merged);
-            write_mmio_u32(mmio, base_addr, updated);
-            if let Some(event) = decode_mmio_write(register_meta, base_addr, 4, updated) {
-                mmio_writes.push(event);
-            }
-            return true;
-        }
-        if is_rcc_cfgr(meta) {
-            let base_addr = addr & !3;
-            let old_val = read_mmio_u32(mmio, base_addr);
-            let merged = merge_mmio_write(old_val, addr, 1, value as u32);
-            let updated = apply_rcc_cfgr_flags(merged);
-            write_mmio_u32(mmio, base_addr, updated);
-            if let Some(event) = decode_mmio_write(register_meta, base_addr, 4, updated) {
-                mmio_writes.push(event);
-            }
-            return true;
-        }
-
         if let Some(reg) = meta.systick {
             systick.write8(reg, meta.byte_offset, value);
             mmio_write_byte(mmio, addr, value);
@@ -1462,31 +1442,26 @@ fn write_special_mmio(
             }
             return true;
         }
-        if is_usart_data(meta) && meta.byte_offset == 0 {
-            serial_output.push(SerialEvent {
-                peripheral: Arc::clone(&meta.peripheral),
-                byte: value,
-            });
-            if let Some(event) = decode_mmio_write(register_meta, addr, 1, value as u32) {
-                mmio_writes.push(event);
-            }
-            mmio_write_byte(mmio, addr, value);
-            return true;
-        }
-        if is_spi_data(meta) && meta.byte_offset == 0 {
-            mmio_write_byte(mmio, addr, value);
-            if let Some(event) = decode_mmio_write(register_meta, addr, 1, value as u32) {
-                mmio_writes.push(event);
-            }
-            spi_mark_data_written(mmio, meta.paired_addr);
-            return true;
-        }
     }
 
-    false
+    // For everything else, merge the byte into the containing word and delegate.
+    let word_addr = addr & !3;
+    let old_word = read_mmio_u32(mmio, word_addr);
+    let shift = (addr & 3) * 8;
+    let new_word = (old_word & !(0xFF << shift)) | ((value as u32) << shift);
+    write_special_mmio_word(
+        mmio,
+        serial_output,
+        mmio_writes,
+        register_meta,
+        systick,
+        word_addr,
+        new_word,
+    )
 }
 
-fn write_special_mmio_u32(
+/// Unified special MMIO write (always word-aligned, 32-bit value).
+fn write_special_mmio_word(
     mmio: &mut HashMap<u64, u32>,
     serial_output: &mut Vec<SerialEvent>,
     mmio_writes: &mut Vec<MmioWriteEvent>,
@@ -1496,35 +1471,19 @@ fn write_special_mmio_u32(
     value: u32,
 ) -> bool {
     if let Some(meta) = register_meta.get(&addr) {
-        if is_rcc_control(meta) {
-            let base_addr = addr & !3;
-            let old_val = read_mmio_u32(mmio, base_addr);
-            let merged = merge_mmio_write(old_val, addr, 4, value);
-            let updated = apply_rcc_ready_flags(base_addr, old_val, merged);
-            write_mmio_u32(mmio, base_addr, updated);
-            if let Some(event) = decode_mmio_write(register_meta, base_addr, 4, updated) {
+        if is_rcc_control(meta) || is_rcc_csr(meta) || is_pwr_csr(meta) {
+            let old_val = read_mmio_u32(mmio, addr);
+            let updated = apply_rcc_ready_flags(addr, old_val, value);
+            write_mmio_u32(mmio, addr, updated);
+            if let Some(event) = decode_mmio_write(register_meta, addr, 4, updated) {
                 mmio_writes.push(event);
             }
             return true;
         }
         if is_rcc_cfgr(meta) {
-            let base_addr = addr & !3;
-            let old_val = read_mmio_u32(mmio, base_addr);
-            let merged = merge_mmio_write(old_val, addr, 4, value);
-            let updated = apply_rcc_cfgr_flags(merged);
-            write_mmio_u32(mmio, base_addr, updated);
-            if let Some(event) = decode_mmio_write(register_meta, base_addr, 4, updated) {
-                mmio_writes.push(event);
-            }
-            return true;
-        }
-        if is_rcc_csr(meta) || is_pwr_csr(meta) {
-            let base_addr = addr & !3;
-            let old_val = read_mmio_u32(mmio, base_addr);
-            let merged = merge_mmio_write(old_val, addr, 4, value);
-            let updated = apply_rcc_ready_flags(base_addr, old_val, merged);
-            write_mmio_u32(mmio, base_addr, updated);
-            if let Some(event) = decode_mmio_write(register_meta, base_addr, 4, updated) {
+            let updated = apply_rcc_cfgr_flags(value);
+            write_mmio_u32(mmio, addr, updated);
+            if let Some(event) = decode_mmio_write(register_meta, addr, 4, updated) {
                 mmio_writes.push(event);
             }
             return true;
@@ -1792,24 +1751,6 @@ fn apply_rcc_cfgr_flags(value: u32) -> u32 {
     let sw = value & 0x3;
     let sws = sw << 2;
     (value & !(0x3 << 2)) | sws
-}
-
-fn merge_mmio_write(old_val: u32, addr: u64, width: u8, value: u32) -> u32 {
-    let offset = (addr & 3) as u32;
-    let shift = offset * 8;
-    let bit_width = (width as u32) * 8;
-    
-    // Mask for the bits being updated
-    let mask = if bit_width >= 32 {
-        0xFFFF_FFFFu32
-    } else {
-        ((1u32 << bit_width).wrapping_sub(1)) << shift
-    };
-    
-    // Ensure the new bits are shifted to the correct byte lane and masked
-    let new_bits = (value << shift) & mask;
-    
-    (old_val & !mask) | new_bits
 }
 
 fn decode_mmio_write(

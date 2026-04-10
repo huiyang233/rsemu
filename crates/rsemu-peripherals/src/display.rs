@@ -135,8 +135,9 @@ impl St7789Core {
             self.framebuffer[idx] = pixel;
             if self.preview_enabled {
                 let rgb = rgb565_to_rgb888(pixel);
+                // Store as u32 whose little-endian bytes are [R, G, B, A] for JS ImageData
                 self.preview_rgba[idx] =
-                    (u32::from(rgb[0]) << 24) | (u32::from(rgb[1]) << 16) | (u32::from(rgb[2]) << 8) | 0xFF;
+                    u32::from(rgb[0]) | (u32::from(rgb[1]) << 8) | (u32::from(rgb[2]) << 16) | 0xFF00_0000;
             }
         }
 
@@ -145,7 +146,7 @@ impl St7789Core {
         if self.preview_enabled && self.ramwr_pixels_written.is_multiple_of(1024) {
             if self.latest_frame_rgba.is_none() {
                 let len = self.preview_rgba.len();
-                self.latest_frame_rgba = Some(std::mem::replace(&mut self.preview_rgba, vec![0; len]));
+                self.latest_frame_rgba = Some(std::mem::replace(&mut self.preview_rgba, vec![0xFF00_0000; len]));
             }
         }
 
@@ -164,10 +165,8 @@ impl St7789Core {
 
     fn emit_frame(&mut self) {
         if self.preview_enabled {
-            if self.latest_frame_rgba.is_none() {
-                let len = self.preview_rgba.len();
-                self.latest_frame_rgba = Some(std::mem::replace(&mut self.preview_rgba, vec![0; len]));
-            }
+            let len = self.preview_rgba.len();
+            self.latest_frame_rgba = Some(std::mem::replace(&mut self.preview_rgba, vec![0xFF00_0000; len]));
         }
         if self.dump_frames {
             let path = format!("{}/frame_{:04}.bin", self.output_dir, self.frame_id);

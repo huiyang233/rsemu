@@ -479,14 +479,14 @@ let config = registry.get_config(id)
 | F-10 | 帧缓冲 JS 侧 3 次拷贝 | ✅ 已修复 | Rust 输出 RGBA，JS 直接 new ImageData 省去 swap 循环 |
 | F-11 | uart_batch 失效 | ✅ 已修复 | 去掉 !is_empty() 条件，仅按 batch size flush，Stop 时 flush |
 | F-12 | UART 每字节 re-render | ✅ 已修复 | 批量接收 bytes[]，64KB 环形缓冲，xterm 用 Uint8Array |
-| F-13 | PeripheralConfig 封闭枚举 | ⬜ 待修复 | |
-| F-14 | 硬编码寄存器名字符串 | ⬜ 待修复 | |
-| F-15 | 硬编码内存区间 | ⬜ 待修复 | |
-| F-16 | IRQ 回调 no-op | ⬜ 待修复 | |
-| F-17 | write_special_mmio 8/32位重复 | ⬜ 待修复 | |
-| F-18 | CpuType 封闭 match | ⬜ 待修复 | |
-| F-19 | 热路径 uppercase 分配 | ⬜ 待修复 | |
+| F-13 | PeripheralConfig 封闭枚举 | ⬜ 待修复 | 需设计重构，暂缓 |
+| F-14 | 硬编码寄存器名字符串 | ⬜ 待修复 | 需 SVD tag 系统，暂缓 |
+| F-15 | 硬编码内存区间 | ⬜ 待修复 | 需从 TargetSpec 注入，暂缓 |
+| F-16 | IRQ 回调 no-op | ⬜ 待修复 | 需中断机制对接，暂缓 |
+| F-17 | write_special_mmio 8/32位重复 | ✅ 已修复 | 统一为 write_special_mmio_word，8位 read-modify-write 后委托 |
+| F-18 | CpuType 封闭 match | ✅ 已修复 | 添加 CpuType::make_cpu() 工厂方法 |
+| F-19 | 热路径 uppercase 分配 | ✅ 已修复 | RegisterMeta 名称预存大写，bus_context 直接比较 |
 | F-20 | gpio char→String 分配 | ✅ 已修复 | 改为 char 直接比较，去掉 .to_string() |
 | F-21 | params Vec<u8> for 4 bytes | ✅ 已修复 | 改为 params_buf: [u8;4] + params_len: u8 栈上固定大小 |
-| F-22 | unsafe transmute 无注释 | ⬜ 待修复 | |
+| F-22 | unsafe transmute 无注释 | ✅ 已修复 | 在 set_uc_bus/get_uc_bus 添加 SAFETY 注释 |
 | F-23 | unwrap() in get_boards | ✅ 已修复 | 改为 ok_or_else 返回 Result |

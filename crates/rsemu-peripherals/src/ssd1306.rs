@@ -185,8 +185,8 @@ impl Ssd1306Core {
             }
             let on = ((byte >> bit) & 1) != 0;
             let px = y * usize::from(self.width) + x;
-            // RGBA format: white = 0xFFFFFF_FF, black = 0x000000_FF
-            self.preview_rgba[px] = if on { 0xFFFF_FF_FF } else { 0x0000_00_FF };
+            // RGBA format: little-endian u32 → bytes [R, G, B, A]
+            self.preview_rgba[px] = if on { 0xFFFF_FFFF } else { 0xFF00_0000 };
         }
     }
 
@@ -229,7 +229,7 @@ impl Ssd1306Core {
     fn snapshot_if_empty(&mut self) {
         if self.latest_frame_rgba.is_none() {
             let len = self.preview_rgba.len();
-            self.latest_frame_rgba = Some(std::mem::replace(&mut self.preview_rgba, vec![0x0000_00_FF; len]));
+            self.latest_frame_rgba = Some(std::mem::replace(&mut self.preview_rgba, vec![0xFF00_0000; len]));
         }
     }
 }
