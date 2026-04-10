@@ -4,6 +4,7 @@ use std::fmt::Debug;
 
 pub mod display;
 pub mod led;
+pub mod ssd1306;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PinMapping {
@@ -34,6 +35,14 @@ pub enum PeripheralConfig {
         #[serde(default = "default_true")]
         active_low: bool,
     },
+    #[serde(rename = "ssd1306_i2c")]
+    Ssd1306I2c {
+        width: u16,
+        height: u16,
+        i2c: String,
+        #[serde(default = "default_ssd1306_addr")]
+        address: u8,
+    },
 }
 
 fn default_output_dir() -> String {
@@ -42,6 +51,10 @@ fn default_output_dir() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_ssd1306_addr() -> u8 {
+    0x3c
 }
 
 pub trait Peripheral: Send + Debug {

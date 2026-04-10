@@ -1,50 +1,45 @@
+use rsemu_core::{
+    AccessWidth, BusAttach, DeviceCapabilities, DeviceHandle, GpioListener, ParallelDevice,
+    SpiSlave, MachineBusInterface, MmioWriteEvent,
+};
 use tracing::info;
-use rsemu_core::{MachineBusInterface, MmioWriteEvent};
 use std::fs;
 use crate::{Peripheral, PinMapping};
 
+// ---------------------------------------------------------------------------
+// St7789Core — single source of truth for all display state
+// ---------------------------------------------------------------------------
+
 #[derive(Debug)]
-pub struct St7789 {
-    width: u16,
-    height: u16,
-    framebuffer: Vec<u16>,
-    output_dir: String,
-    dump_frames: bool,
-    frame_id: u32,
-    current_cmd: Option<u8>,
-    params: Vec<u8>,
-    window_x0: u16,
-    window_x1: u16,
-    window_y0: u16,
-    window_y1: u16,
-    cursor_x: u16,
-    cursor_y: u16,
-    pixel_hi: Option<u8>,
-    
-    // Wiring
-    _spi_base: u64,
-    cs: PinMapping,
-    dc: PinMapping,
-    _res: Option<PinMapping>,
-
-    cs_state: u8,
-    dc_state: u8,
-
-    ramwr_pixels_written: u32,
-    latest_frame_argb: Option<Vec<u32>>,
-    preview_argb: Vec<u32>,
-    preview_enabled: bool,
+pub struct St7789Core {
+    pub width: u16,
+    pub height: u16,
+    pub framebuffer: Vec<u16>,
+    pub output_dir: String,
+    pub dump_frames: bool,
+    pub frame_id: u32,
+    pub current_cmd: Option<u8>,
+    pub params: Vec<u8>,
+    pub window_x0: u16,
+    pub window_x1: u16,
+    pub window_y0: u16,
+    pub window_y1: u16,
+    pub cursor_x: u16,
+    pub cursor_y: u16,
+    pub pixel_hi: Option<u8>,
+    pub ramwr_pixels_written: u32,
+    pub latest_frame_argb: Option<Vec<u32>>,
+    pub preview_argb: Vec<u32>,
+    pub preview_enabled: bool,
+    pub dc: bool,
+    pub cs_active: bool,
 }
 
-impl St7789 {
+impl St7789Core {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         width: u16,
         height: u16,
-        spi_base: u64,
-        cs: PinMapping,
-        dc: PinMapping,
-        res: Option<PinMapping>,
         output_dir: String,
         dump_frames: bool,
         preview_enabled: bool,
@@ -68,12 +63,8 @@ impl St7789 {
             cursor_x: 0,
             cursor_y: 0,
             pixel_hi: None,
-            _spi_base: spi_base,
-            cs,
-            dc,
-            _res: res,
-            cs_state: 1,
-            dc_state: 0,
+            dc: false,
+            cs_active: false,
             ramwr_pixels_written: 0,
             latest_frame_argb: None,
             preview_argb: if preview_enabled {
@@ -85,11 +76,7 @@ impl St7789 {
         }
     }
 
-    pub fn latest_frame(&mut self) -> Option<Vec<u32>> {
-        self.latest_frame_argb.take()
-    }
-
-    fn on_command(&mut self, cmd: u8) {
+    pub fn write_command(&mut self, cmd: u8) {
         self.current_cmd = Some(cmd);
         self.params.clear();
         self.pixel_hi = None;
@@ -100,7 +87,7 @@ impl St7789 {
         }
     }
 
-    fn on_data(&mut self, byte: u8) {
+    pub fn write_data(&mut self, byte: u8) {
         match self.current_cmd {
             Some(0x2A) => {
                 self.params.push(byte);
@@ -136,18 +123,18 @@ impl St7789 {
         let x = self.cursor_x.min(self.width.saturating_sub(1));
         let y = self.cursor_y.min(self.height.saturating_sub(1));
         let idx = usize::from(y) * usize::from(self.width) + usize::from(x);
-        
+
         if idx < self.framebuffer.len() {
             self.framebuffer[idx] = pixel;
             if self.preview_enabled {
                 let rgb = rgb565_to_rgb888(pixel);
-                self.preview_argb[idx] = 0xFF00_0000 | ((u32::from(rgb[0])) << 16) | ((u32::from(rgb[1])) << 8) | u32::from(rgb[2]);
+                self.preview_argb[idx] =
+                    0xFF00_0000 | (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]);
             }
         }
 
         self.ramwr_pixels_written = self.ramwr_pixels_written.saturating_add(1);
-        
-        // Update preview periodically for real-time feel
+
         if self.preview_enabled && self.ramwr_pixels_written.is_multiple_of(1024) {
             if self.latest_frame_argb.is_none() {
                 self.latest_frame_argb = Some(self.preview_argb.clone());
@@ -175,16 +162,176 @@ impl St7789 {
         }
         if self.dump_frames {
             let path = format!("{}/frame_{:04}.bin", self.output_dir, self.frame_id);
-            let _ = fs::write(path, unsafe {
-                std::slice::from_raw_parts(
-                    self.framebuffer.as_ptr() as *const u8,
-                    self.framebuffer.len() * 2,
-                )
-            });
+            let _ = fs::write(
+                path,
+                unsafe {
+                    std::slice::from_raw_parts(
+                        self.framebuffer.as_ptr() as *const u8,
+                        self.framebuffer.len() * 2,
+                    )
+                },
+            );
         }
         self.frame_id = self.frame_id.wrapping_add(1);
     }
+
+    pub fn latest_frame(&mut self) -> Option<Vec<u32>> {
+        self.latest_frame_argb.take()
+    }
 }
+
+// ---------------------------------------------------------------------------
+// St7789 — top-level struct implementing BusAttach + legacy Peripheral
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct St7789 {
+    core: St7789Core,
+
+    // Pin wiring (used by legacy Peripheral::on_mmio_write for GPIO tracking)
+    cs: PinMapping,
+    dc: PinMapping,
+    _res: Option<PinMapping>,
+}
+
+impl St7789 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        width: u16,
+        height: u16,
+        _spi_base: u64,
+        cs: PinMapping,
+        dc: PinMapping,
+        res: Option<PinMapping>,
+        output_dir: String,
+        dump_frames: bool,
+        preview_enabled: bool,
+    ) -> Self {
+        Self {
+            core: St7789Core::new(width, height, output_dir, dump_frames, preview_enabled),
+            cs,
+            dc,
+            _res: res,
+        }
+    }
+
+    pub fn latest_frame(&mut self) -> Option<Vec<u32>> {
+        self.core.latest_frame()
+    }
+
+    pub fn width(&self) -> u16 {
+        self.core.width
+    }
+
+    pub fn height(&self) -> u16 {
+        self.core.height
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SpiSlave implementation — uses core's dc state to route command vs data
+// ---------------------------------------------------------------------------
+
+impl SpiSlave for St7789 {
+    fn transfer(&mut self, mosi: u8) -> u8 {
+        if !self.core.cs_active {
+            return 0;
+        }
+        if self.core.dc {
+            self.core.write_data(mosi);
+        } else {
+            info!("st7789.cmd_write 0x{:02x}", mosi);
+            self.core.write_command(mosi);
+        }
+        0 // ST7789 does not return data on MISO
+    }
+
+    fn chip_select(&mut self, active: bool) {
+        self.core.cs_active = active;
+    }
+
+    fn reset(&mut self) {
+        // Keep framebuffer and dimensions, reset protocol state
+        self.core.current_cmd = None;
+        self.core.params.clear();
+        self.core.pixel_hi = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GpioListener implementation — tracks DC and CS pins
+// ---------------------------------------------------------------------------
+
+impl GpioListener for St7789 {
+    fn pin_changed(&mut self, port: char, pin: u8, high: bool) {
+        if port.to_uppercase().to_string() == self.cs.port && pin == self.cs.pin {
+            self.core.cs_active = high;
+        }
+        if port.to_uppercase().to_string() == self.dc.port && pin == self.dc.pin {
+            self.core.dc = high;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ParallelDevice implementation — for FSMC bus (e.g., ST7789 via FSMC on F407)
+// ---------------------------------------------------------------------------
+
+impl ParallelDevice for St7789 {
+    fn write(&mut self, addr: u32, data: u32, _width: AccessWidth) {
+        // FSMC: address bit 0 encodes RS/DC (0 = command, 1 = data)
+        let dc = (addr & 1) == 1;
+        let byte = (data & 0xFF) as u8;
+        if dc {
+            self.core.write_data(byte);
+        } else {
+            info!("st7789.cmd_write(FSMC) 0x{:02x}", byte);
+            self.core.write_command(byte);
+        }
+    }
+
+    fn read(&mut self, _addr: u32, _width: AccessWidth) -> u32 {
+        0 // ST7789 is write-only in typical FSMC LCD usage
+    }
+
+    fn reset(&mut self) {
+        self.core.current_cmd = None;
+        self.core.params.clear();
+        self.core.pixel_hi = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BusAttach implementation — declares SPI_SLAVE + PARALLEL + GPIO_LISTENER
+// ---------------------------------------------------------------------------
+
+impl BusAttach for St7789 {
+    fn as_spi_slave(&mut self) -> Option<&mut dyn SpiSlave> {
+        Some(self)
+    }
+    fn as_parallel(&mut self) -> Option<&mut dyn ParallelDevice> {
+        Some(self)
+    }
+    fn as_gpio_listener(&mut self) -> Option<&mut dyn GpioListener> {
+        Some(self)
+    }
+}
+
+/// Create a DeviceHandle for St7789 with its capabilities declared.
+impl St7789 {
+    pub fn into_device_handle(self) -> DeviceHandle {
+        DeviceHandle::new(
+            DeviceCapabilities::SPI_SLAVE
+                | DeviceCapabilities::PARALLEL
+                | DeviceCapabilities::GPIO_LISTENER,
+            Box::new(self),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy Peripheral trait — still supported for backward compatibility
+// ---------------------------------------------------------------------------
 
 impl Peripheral for St7789 {
     fn name(&self) -> &str {
@@ -196,56 +343,55 @@ impl Peripheral for St7789 {
     }
 
     fn on_mmio_write(&mut self, _machine: &dyn MachineBusInterface, event: &MmioWriteEvent) {
-        // Track GPIO state for CS/DC
+        // Track GPIO state for CS/DC (legacy path)
         if event.peripheral.ends_with(&self.cs.port) || event.peripheral == self.cs.port {
             if event.register.eq_ignore_ascii_case("ODR") {
-                self.cs_state = ((event.value >> self.cs.pin) & 1) as u8;
+                let high = ((event.value >> self.cs.pin) & 1) != 0;
+                self.core.cs_active = high;
             } else if event.register.eq_ignore_ascii_case("BSRR") {
                 let set = (event.value >> self.cs.pin) & 1;
                 let reset = (event.value >> (self.cs.pin + 16)) & 1;
                 if reset != 0 {
-                    self.cs_state = 0;
+                    self.core.cs_active = false;
                 } else if set != 0 {
-                    self.cs_state = 1;
+                    self.core.cs_active = true;
                 }
             }
         }
         if event.peripheral.ends_with(&self.dc.port) || event.peripheral == self.dc.port {
             if event.register.eq_ignore_ascii_case("ODR") {
-                self.dc_state = ((event.value >> self.dc.pin) & 1) as u8;
+                let high = ((event.value >> self.dc.pin) & 1) != 0;
+                self.core.dc = high;
             } else if event.register.eq_ignore_ascii_case("BSRR") {
                 let set = (event.value >> self.dc.pin) & 1;
                 let reset = (event.value >> (self.dc.pin + 16)) & 1;
                 if reset != 0 {
-                    self.dc_state = 0;
+                    self.core.dc = false;
                 } else if set != 0 {
-                    self.dc_state = 1;
+                    self.core.dc = true;
                 }
             }
         }
 
         // Process SPI data
         if event.peripheral.starts_with("SPI") && event.register.eq_ignore_ascii_case("DR") {
-            let cs = self.cs_state;
-            let dc = self.dc_state;
             let byte = (event.value & 0xFF) as u8;
-
-            if cs != 0 {
+            if self.core.cs_active {
                 return;
             }
-
-            // Check Data/Command (DC)
-            let dc_is_data = dc != 0;
-
-            if dc_is_data {
-                self.on_data(byte);
+            if self.core.dc {
+                self.core.write_data(byte);
             } else {
                 info!("st7789.cmd_write 0x{:02x}", byte);
-                self.on_command(byte);
+                self.core.write_command(byte);
             }
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn rgb565_to_rgb888(p: u16) -> [u8; 3] {
     let r = (((p >> 11) & 0x1F) as u8) << 3;

@@ -1,5 +1,8 @@
 use crate::{Peripheral, PinMapping};
-use rsemu_core::{MachineBusInterface, MmioWriteEvent};
+use rsemu_core::{
+    BusAttach, DeviceCapabilities, DeviceHandle, GpioListener,
+    MachineBusInterface, MmioWriteEvent,
+};
 
 #[derive(Debug)]
 pub struct Led {
@@ -29,12 +32,6 @@ impl Led {
         }
     }
 
-    fn port_matches(&self, peripheral: &str) -> bool {
-        let p = peripheral.trim().to_ascii_uppercase();
-        let wanted = self.pin.port.trim().to_ascii_uppercase();
-        p == format!("GPIO{wanted}") || p == wanted
-    }
-
     fn pin_name(&self) -> String {
         format!("P{}{}", self.pin.port.to_ascii_uppercase(), self.pin.pin)
     }
@@ -49,7 +46,42 @@ impl Led {
         let state = if on { "on" } else { "off" };
         eprintln!("led.{} = {} ({})", self.id, state, self.pin_name());
     }
+
+    pub fn into_device_handle(self) -> DeviceHandle {
+        DeviceHandle::new(
+            DeviceCapabilities::GPIO_LISTENER,
+            Box::new(self),
+        )
+    }
 }
+
+// ---------------------------------------------------------------------------
+// GpioListener implementation
+// ---------------------------------------------------------------------------
+
+impl GpioListener for Led {
+    fn pin_changed(&mut self, port: char, pin: u8, high: bool) {
+        let port_upper = port.to_ascii_uppercase();
+        let wanted_port = self.pin.port.trim().to_ascii_uppercase();
+        if port_upper.to_string() == wanted_port && pin == self.pin.pin {
+            self.update_level(high);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BusAttach implementation
+// ---------------------------------------------------------------------------
+
+impl BusAttach for Led {
+    fn as_gpio_listener(&mut self) -> Option<&mut dyn GpioListener> {
+        Some(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy Peripheral trait
+// ---------------------------------------------------------------------------
 
 impl Peripheral for Led {
     fn name(&self) -> &str {
@@ -61,7 +93,9 @@ impl Peripheral for Led {
     }
 
     fn on_mmio_write(&mut self, _machine: &dyn MachineBusInterface, event: &MmioWriteEvent) {
-        if !self.port_matches(&event.peripheral) {
+        let p = event.peripheral.trim().to_ascii_uppercase();
+        let wanted = self.pin.port.trim().to_ascii_uppercase();
+        if p != format!("GPIO{wanted}") && p != wanted {
             return;
         }
         if event.register.eq_ignore_ascii_case("ODR") {

@@ -8,3 +8,4 @@ license.workspace = true
 unicorn-engine.workspace = true
 tracing.workspace = true
 log.workspace = true
+bitflags = "2"

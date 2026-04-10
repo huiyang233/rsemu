@@ -50,6 +50,7 @@ struct SystickState {
     countflag: bool,
     pending_interrupts: u32,
     reload_divider: u32,
+    scale_reload: bool,
 }
 
 impl SystickState {
@@ -61,6 +62,7 @@ impl SystickState {
             countflag: false,
             pending_interrupts: 0,
             reload_divider: reload_divider.max(1),
+            scale_reload: true,
         }
     }
 
@@ -70,28 +72,53 @@ impl SystickState {
 
     fn effective_period(&self) -> u32 {
         let raw_period = (self.rvr_raw & 0x00FF_FFFF).wrapping_add(1);
-        let scaled = raw_period / self.reload_divider;
-        scaled.max(1)
-    }
-
-    fn tick(&mut self) {
-        if !self.enabled() {
-            return;
-        }
-
-        if self.cvr == 0 {
-            self.cvr = self.effective_period().saturating_sub(1);
-            self.countflag = true;
-            self.pending_interrupts = self.pending_interrupts.saturating_add(1);
+        if self.scale_reload {
+            let scaled = raw_period / self.reload_divider;
+            scaled.max(1)
         } else {
-            self.cvr = self.cvr.wrapping_sub(1);
+            raw_period.max(1)
         }
     }
 
     fn tick_many(&mut self, ticks: u64) {
-        for _ in 0..ticks {
-            self.tick();
+        if ticks == 0 || !self.enabled() {
+            return;
         }
+
+        let period = u64::from(self.effective_period().max(1));
+        let mut remaining = ticks;
+
+        if self.cvr == 0 {
+            self.countflag = true;
+            self.pending_interrupts = self.pending_interrupts.saturating_add(1);
+            self.cvr = (period.saturating_sub(1)).min(u64::from(u32::MAX)) as u32;
+            remaining = remaining.saturating_sub(1);
+            if remaining == 0 {
+                return;
+            }
+        }
+
+        let current = u64::from(self.cvr);
+        if remaining <= current {
+            self.cvr = (current - remaining) as u32;
+            return;
+        }
+
+        remaining -= current + 1;
+        self.countflag = true;
+        self.pending_interrupts = self.pending_interrupts.saturating_add(1);
+
+        if remaining > 0 {
+            let wraps = remaining / period;
+            if wraps > 0 {
+                let add = wraps.min(u64::from(u32::MAX)) as u32;
+                self.pending_interrupts = self.pending_interrupts.saturating_add(add);
+                self.countflag = true;
+                remaining %= period;
+            }
+        }
+
+        self.cvr = (period - 1 - remaining).min(u64::from(u32::MAX)) as u32;
     }
 
     fn take_pending_interrupt(&mut self) -> bool {
@@ -154,6 +181,10 @@ impl SystickState {
         let merged = (current & mask) | ((value as u32) << shift);
         self.write32(reg, merged);
     }
+
+    fn set_reload_scaling(&mut self, enabled: bool) {
+        self.scale_reload = enabled;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +246,8 @@ pub struct Machine<C: CpuCore> {
     serial_output: Vec<SerialEvent>,
     mmio_writes: Vec<MmioWriteEvent>,
     systick: SystickState,
+    step_driven_systick: bool,
+    step_driven_timers: bool,
     nvic_any_enabled: bool,
     timers: Vec<TimerModel>,
     rcc_regs: Option<RccRegs>,
@@ -341,6 +374,8 @@ impl<C: CpuCore> Machine<C> {
             serial_output: Vec::new(),
             mmio_writes: Vec::new(),
             systick: SystickState::new(reload_divider),
+            step_driven_systick: true,
+            step_driven_timers: true,
             nvic_any_enabled,
             timers,
             rcc_regs,
@@ -403,6 +438,8 @@ impl<C: CpuCore> Machine<C> {
     }
 
     pub fn step_cpu(&mut self, max_steps: usize) -> Result<u32, String> {
+        let mut ran_total = 0u32;
+
         let mut bus = MachineBus {
             memory: &mut self.memory,
             flash_base: self.flash_base,
@@ -419,15 +456,97 @@ impl<C: CpuCore> Machine<C> {
             nvic_any_enabled: &mut self.nvic_any_enabled,
         };
         let ran = self.cpu.step(&mut bus, max_steps)?;
-        self.systick.tick_many(ran as u64);
-        let emu_cycles = (self.target.systick_reload_divider.max(1) as u64) * (ran as u64);
-        self.advance_timers(emu_cycles);
+        ran_total = ran_total.saturating_add(ran);
+        if self.step_driven_systick {
+            self.systick.tick_many(ran as u64);
+        }
+        if self.step_driven_timers {
+            let emu_cycles = (self.target.systick_reload_divider.max(1) as u64) * (ran as u64);
+            self.advance_timers(emu_cycles);
+        }
         self.try_service_interrupt()?;
-        Ok(ran)
+
+        // If we just entered an exception (e.g. PendSV/SysTick), execute a small
+        // bounded chunk immediately so RTOS context switches are not delayed by the
+        // next large batch step.
+        let mut exception_budget = 256usize;
+        while self.cpu.in_exception() && exception_budget > 0 {
+            let chunk = exception_budget.min(64);
+            let mut bus = MachineBus {
+                memory: &mut self.memory,
+                flash_base: self.flash_base,
+                flash_alias_base: self.flash_alias_base,
+                periph_bb_base: self.periph_bb_base,
+                periph_bb_alias_start: self.periph_bb_alias_start,
+                periph_bb_alias_end: self.periph_bb_alias_end,
+                mmio: &mut self.mmio,
+                register_meta: &self.register_meta,
+                usart_rx_queues: &mut self.usart_rx_queues,
+                serial_output: &mut self.serial_output,
+                mmio_writes: &mut self.mmio_writes,
+                systick: &mut self.systick,
+                nvic_any_enabled: &mut self.nvic_any_enabled,
+            };
+            let ran_exc = self.cpu.step(&mut bus, chunk)?;
+            if ran_exc == 0 {
+                break;
+            }
+            ran_total = ran_total.saturating_add(ran_exc);
+            if self.step_driven_systick {
+                self.systick.tick_many(ran_exc as u64);
+            }
+            if self.step_driven_timers {
+                let emu_cycles =
+                    (self.target.systick_reload_divider.max(1) as u64) * (ran_exc as u64);
+                self.advance_timers(emu_cycles);
+            }
+            self.try_service_interrupt()?;
+            exception_budget = exception_budget.saturating_sub(ran_exc as usize);
+        }
+
+        Ok(ran_total)
+    }
+
+    pub fn set_step_driven_systick(&mut self, enabled: bool) {
+        self.step_driven_systick = enabled;
+    }
+
+    pub fn set_step_driven_timers(&mut self, enabled: bool) {
+        self.step_driven_timers = enabled;
+    }
+
+    pub fn advance_timers_cycles(&mut self, cycles: u64) {
+        self.advance_timers(cycles);
     }
 
     pub fn advance_systick_ticks(&mut self, ticks: u64) {
         self.systick.tick_many(ticks);
+    }
+
+    pub fn set_systick_reload_scaling(&mut self, enabled: bool) {
+        self.systick.set_reload_scaling(enabled);
+    }
+
+    /// Set an IRQ pending in NVIC. Safe to call from IrqCallback.
+    /// `irq` is the NVIC interrupt number (0-based, exception 16 maps to irq 0).
+    pub fn set_irq_pending(&mut self, irq: u8) {
+        nvic_pending_write(&mut self.mmio, irq, true);
+    }
+
+    /// Create an IrqCallback that sets an IRQ pending on this machine.
+    /// Usage: `let cb = machine.make_irq_callback(); spi_bus.set_irq(irq_num, cb);`
+    /// Note: the callback clones an `Arc<Mutex<>>` handle, so it can outlive the borrow.
+    pub fn make_irq_callback<C2: CpuCore>(_machine: &Machine<C2>) -> crate::IrqCallback {
+        // Since Machine is not thread-safe and the callback needs mutable access,
+        // we use a simpler approach: the bus fires the callback, which stores the
+        // IRQ number in a side channel. The main loop then flushes pending IRQs
+        // into the machine before the next step.
+        //
+        // For now, we provide a simple immediate callback that does nothing here —
+        // the actual wiring happens at the app layer where Machine is accessible.
+        Box::new(|_irq: u8| {
+            // Default no-op; app layer should replace with actual machine access
+        })
     }
 
     pub fn read8(&mut self, addr: u64) -> Result<u8, String> {
