@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import type { BoardInfo } from "../types/board";
 import type { PeripheralConfig } from "../types/peripheral";
+import type { AppPreferences } from "../types/project";
 import type {
   SimStatusPayload,
   LedChangedPayload,
@@ -39,6 +40,38 @@ export async function sendUart(peripheral: string, bytes: number[]): Promise<voi
 
 export async function openFirmwareDialog(): Promise<string | null> {
   return invoke<string | null>("open_firmware_dialog");
+}
+
+export async function getAppPreferences(): Promise<AppPreferences> {
+  return invoke<AppPreferences>("get_app_preferences");
+}
+
+export async function rememberProject(path: string): Promise<AppPreferences> {
+  return invoke<AppPreferences>("remember_project", { path });
+}
+
+export async function forgetProject(path: string): Promise<AppPreferences> {
+  return invoke<AppPreferences>("forget_project", { path });
+}
+
+export async function clearLastProject(): Promise<AppPreferences> {
+  return invoke<AppPreferences>("clear_last_project");
+}
+
+export async function openProjectDialog(): Promise<string | null> {
+  return invoke<string | null>("open_project_dialog");
+}
+
+export async function saveProjectDialog(): Promise<string | null> {
+  return invoke<string | null>("save_project_dialog");
+}
+
+export async function readProjectFile(path: string): Promise<string> {
+  return invoke<string>("read_project_file", { path });
+}
+
+export async function writeProjectFile(path: string, content: string): Promise<void> {
+  return invoke("write_project_file", { path, content });
 }
 
 // ── Module-level event bus ────────────────────────────────────────────────────

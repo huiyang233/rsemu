@@ -1,27 +1,31 @@
 import React, { useRef, useEffect, useCallback } from "react";
-import { onDisplayFrame } from "../../lib/tauri";
-import type { St7789Config } from "../../types/peripheral";
+import { onDisplayFrame } from "../../../lib/tauri";
+import type { Ssd1306I2cConfig } from "../../../types/peripheral";
 
 interface Props {
-  config: St7789Config;
+  config: Ssd1306I2cConfig;
 }
 
-export default function DisplayWidget({ config }: Props) {
+function normalizeSize(width: number, height: number): [number, number] {
+  const w = [64, 72, 96, 128].includes(width) ? width : 128;
+  const h = [32, 40, 48, 64].includes(height) ? height : 64;
+  return [w, h];
+}
+
+export default function Ssd1306Widget({ config }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const hasFrameRef = useRef(false);
+  const [cfgW, cfgH] = normalizeSize(config.width, config.height);
 
   const drawFrame = useCallback(
     (width: number, height: number, data: string) => {
+      if (width !== cfgW || height !== cfgH) return;
       const canvas = canvasRef.current;
       if (!canvas) return;
 
-      // Decode base64 → Uint8Array
       const binary = atob(data);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
-      // The backend sends ARGB (LE u32 per pixel). Canvas expects RGBA.
-      // LE u32 ARGB = bytes [B, G, R, A] in memory.
       const rgba = new Uint8ClampedArray(width * height * 4);
       for (let i = 0; i < width * height; i++) {
         const b = bytes[i * 4 + 0];
@@ -31,16 +35,16 @@ export default function DisplayWidget({ config }: Props) {
         rgba[i * 4 + 0] = r;
         rgba[i * 4 + 1] = g;
         rgba[i * 4 + 2] = b;
-        rgba[i * 4 + 3] = a === 0 ? 255 : a; // treat fully transparent as opaque
+        rgba[i * 4 + 3] = a === 0 ? 255 : a;
       }
 
       canvas.width = width;
       canvas.height = height;
-      const ctx = canvas.getContext("2d")!;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
       ctx.putImageData(new ImageData(rgba, width, height), 0, 0);
-      hasFrameRef.current = true;
     },
-    []
+    [cfgH, cfgW]
   );
 
   useEffect(() => {
@@ -54,23 +58,19 @@ export default function DisplayWidget({ config }: Props) {
   return (
     <div className="flex flex-col gap-2">
       <div
-        className="relative rounded overflow-hidden border border-[#3a3a5e] bg-black"
-        style={{ width: config.width, height: config.height }}
+        className="relative rounded overflow-hidden border border-[#3a3a5e] bg-black p-1"
+        style={{ width: cfgW * 2, height: cfgH * 2 }}
       >
         <canvas
           ref={canvasRef}
-          width={config.width}
-          height={config.height}
+          width={cfgW}
+          height={cfgH}
           className="block"
           style={{ imageRendering: "pixelated", width: "100%", height: "100%" }}
         />
-        {/* Overlay when no frame yet */}
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-          <p className="text-[#45475a] text-xs">No frame yet</p>
-        </div>
       </div>
       <p className="text-xs text-[#6c7086] text-center">
-        ST7789 {config.width}×{config.height}
+        SSD1306(I2C) {cfgW}×{cfgH} @ 0x{config.address.toString(16)}
       </p>
     </div>
   );

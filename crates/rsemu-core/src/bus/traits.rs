@@ -50,6 +50,14 @@ pub trait SystemBus {
     }
 }
 
+/// A display frame update, produced by poll_frame().
+#[derive(Debug, Clone)]
+pub struct FrameUpdate {
+    pub width: u16,
+    pub height: u16,
+    pub pixels: Vec<u32>, // ARGB, row-major
+}
+
 /// SPI slave device — reflects full-duplex transfer timing.
 pub trait SpiSlave: Send {
     /// SPI transfer: master sends `mosi`, slave returns `miso` synchronously.
@@ -60,6 +68,15 @@ pub trait SpiSlave: Send {
 
     /// Device reset.
     fn reset(&mut self);
+
+    /// Optional: poll for a new display frame. Default returns None.
+    fn poll_frame(&mut self) -> Option<FrameUpdate> {
+        None
+    }
+
+    /// Optional: GPIO pin change on this device (e.g., DC/RS pin).
+    /// Default does nothing. Devices that listen to GPIO pins override this.
+    fn gpio_pin_changed(&mut self, _port: char, _pin: u8, _high: bool) {}
 }
 
 /// I2C slave device — reflects START / address / read-write / STOP timing.
@@ -80,6 +97,11 @@ pub trait I2cSlave: Send {
 
     /// Device reset.
     fn reset(&mut self);
+
+    /// Optional: poll for a new display frame. Default returns None.
+    fn poll_frame(&mut self) -> Option<FrameUpdate> {
+        None
+    }
 }
 
 /// UART device — bidirectional, asynchronous.
@@ -100,6 +122,11 @@ pub trait ParallelDevice: Send {
     fn write(&mut self, addr: u32, data: u32, width: AccessWidth);
     fn read(&mut self, addr: u32, width: AccessWidth) -> u32;
     fn reset(&mut self);
+
+    /// Optional: poll for a new display frame. Default returns None.
+    fn poll_frame(&mut self) -> Option<FrameUpdate> {
+        None
+    }
 }
 
 /// GPIO pin-change listener (for DC/RS control lines, LEDs, buttons, etc.).

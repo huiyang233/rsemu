@@ -1,6 +1,6 @@
 import React, { useCallback, useRef } from "react";
 import type { CanvasItem } from "../../types/peripheral";
-import { getPeripheralDef } from "../../lib/peripheralDefs";
+import { getPeripheralDef } from "../peripherals/registry";
 import Button from "../ui/Button";
 
 interface Props {
@@ -46,6 +46,21 @@ export default function PeripheralNode({ item, onConfigure, onRemove, onMove }: 
     },
     [item, onMove]
   );
+
+  if (!def) {
+    return (
+      <div
+        style={{ left: item.position.x, top: item.position.y }}
+        className="absolute w-36 rounded border border-red-500/50 bg-red-900/30 select-none cursor-move p-2"
+        onMouseDown={handleMouseDown}
+      >
+        <p className="text-xs text-red-400">Unknown: {item.type}</p>
+        <button onClick={() => onRemove(item.instanceId)} className="text-xs text-[#6c7086] hover:text-red-400 mt-1">
+          Remove
+        </button>
+      </div>
+    );
+  }
 
   const configured = item.config !== null;
 

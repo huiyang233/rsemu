@@ -1,4 +1,4 @@
-use rsemu_core::I2cSlave;
+use rsemu_core::{FrameUpdate, I2cSlave};
 
 // ---------------------------------------------------------------------------
 // SSD1306 Core — single source of truth for all display state
@@ -317,6 +317,14 @@ impl I2cSlave for Ssd1306I2c {
         self.core.stream_kind = None;
         self.core.pending_cmd = None;
         self.core.pending_left = 0;
+    }
+
+    fn poll_frame(&mut self) -> Option<FrameUpdate> {
+        self.core.latest_frame().map(|pixels| FrameUpdate {
+            width: self.core.width,
+            height: self.core.height,
+            pixels,
+        })
     }
 }
 

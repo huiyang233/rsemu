@@ -1,15 +1,14 @@
 use crate::cli::CliArgs;
-use crate::clock_model::RccClockModel;
 use minifb::{Key, Scale, Window, WindowOptions};
 use rsemu_core::cpu::armv7em::CortexM4;
 use rsemu_core::cpu::armv7m::CortexM3;
 use rsemu_core::{
-    CpuCore, FirmwareLoader, GpioListener, GpioNotifier, GpioPin, Machine, MmioWriteEvent,
-    SpiSlave, TargetSpec,
+    BusContext, CpuCore, FirmwareLoader, GpioPin, Machine, RccClockModel,
+    SpiBus, StepBatchController, TargetSpec, gpio_port_letter,
 };
 use rsemu_peripherals::display::St7789;
 use rsemu_peripherals::led::Led;
-use rsemu_peripherals::PinMapping;
+use rsemu_peripherals::{PeripheralConfig, PinMapping};
 use rsemu_targets::stm32::{f103, f407};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -61,48 +60,7 @@ struct BoardConfig {
     load_addr: Option<u32>,
     cycle_scale: Option<u32>,
     #[serde(default)]
-    peripherals: Vec<BoardPeripheralConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
-enum BoardPeripheralConfig {
-    #[serde(rename = "st7789")]
-    St7789 {
-        #[allow(dead_code)]
-        id: Option<String>,
-        #[serde(default = "default_true")]
-        enabled: bool,
-        width: u16,
-        height: u16,
-        spi_base: u64,
-        cs: PinMapping,
-        dc: PinMapping,
-        res: Option<PinMapping>,
-        #[serde(default)]
-        dump_frames: bool,
-        #[serde(default = "default_output_dir")]
-        output_dir: String,
-    },
-    #[serde(rename = "uart_terminal")]
-    UartTerminal {
-        #[allow(dead_code)]
-        id: Option<String>,
-        #[serde(default = "default_true")]
-        enabled: bool,
-        usart: String,
-        tx: PinMapping,
-        rx: PinMapping,
-    },
-    #[serde(rename = "led")]
-    Led {
-        id: Option<String>,
-        #[serde(default = "default_true")]
-        enabled: bool,
-        pin: PinMapping,
-        #[serde(default = "default_true")]
-        active_low: bool,
-    },
+    peripherals: Vec<PeripheralConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,14 +68,6 @@ struct UartTerminalBinding {
     usart: String,
     tx: PinMapping,
     rx: PinMapping,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_output_dir() -> String {
-    "/tmp/rsemu-frames".to_string()
 }
 
 fn load_board_config(path: &str) -> Result<BoardConfig, String> {
@@ -142,18 +92,6 @@ fn read_optional_string(path: Option<String>) -> Result<Option<String>, String> 
     };
     let content = fs::read_to_string(&path).map_err(|e| format!("failed to read file {path}: {e}"))?;
     Ok(Some(content))
-}
-
-// ── Bus-device context (replaces Vec<Box<dyn Peripheral>>) ─────────────────
-
-/// Tracks which SPI peripheral a ST7789 is connected to.
-struct St7789BusHandle {
-    spi_peripheral: String, // e.g. "SPI1"
-    cs_port: char,
-    cs_pin: u8,
-    dc_port: char,
-    dc_pin: u8,
-    device: St7789,
 }
 
 fn run_with_cpu<C: CpuCore>(
@@ -201,31 +139,21 @@ fn run_with_cpu<C: CpuCore>(
         let mut serial_cursor = 0usize;
         let mut mmio_cursor = 0usize;
 
-        // ── Build bus-device context ───────────────────────────────────────
-        let mut st7789_handles: Vec<St7789BusHandle> = Vec::new();
+        // ── Build BusContext ────────────────────────────────────────────────
+        let mut bus_ctx = BusContext::new();
         let mut uart_bindings: Vec<UartTerminalBinding> = Vec::new();
         let mut st7789_window_size: Option<(usize, usize)> = None;
-        let mut gpio_notifier = GpioNotifier::new();
-        // Track LED ids for event emission
-        let mut led_ids: Vec<(String, char, u8)> = Vec::new();
 
         for periph in &board.peripherals {
             match periph {
-                BoardPeripheralConfig::St7789 {
-                    enabled,
+                PeripheralConfig::St7789Spi {
                     width,
                     height,
                     spi_base,
                     cs,
                     dc,
                     res,
-                    dump_frames,
-                    output_dir,
-                    ..
                 } => {
-                    if !enabled {
-                        continue;
-                    }
                     let preview_enabled = !args.no_gui;
                     let panel_width = *width;
                     let panel_height = *height;
@@ -236,74 +164,58 @@ fn run_with_cpu<C: CpuCore>(
                         cs.clone(),
                         dc.clone(),
                         res.clone(),
-                        output_dir.clone(),
-                        *dump_frames || args.dump_frames,
+                        String::new(),
+                        false,
                         preview_enabled,
                     );
                     let cs_port = cs.port.chars().next().unwrap_or('A').to_ascii_uppercase();
                     let dc_port = dc.port.chars().next().unwrap_or('A').to_ascii_uppercase();
-                    // Find which SPI peripheral by scanning target for SPI at spi_base
                     let spi_peripheral = target.peripherals.iter()
                         .find(|p| p.base_address == *spi_base)
                         .map(|p| p.name.to_ascii_uppercase())
                         .unwrap_or_else(|| format!("SPI{}", spi_base & 0xFFFF));
                     info!("bus.register ST7789 → {} (CS=P{}{}, DC=P{}{})",
                         spi_peripheral, cs_port, cs.pin, dc_port, dc.pin);
-                    st7789_handles.push(St7789BusHandle {
-                        spi_peripheral,
-                        cs_port,
-                        cs_pin: cs.pin,
-                        dc_port,
-                        dc_pin: dc.pin,
-                        device,
-                    });
+                    let spi_bus = SpiBus::new(Box::new(device));
+                    let cs_pin = Some(GpioPin::new(cs_port, cs.pin));
+                    let dc_pin = Some(GpioPin::new(dc_port, dc.pin));
+                    bus_ctx.register_spi(spi_peripheral, spi_bus, cs_pin, dc_pin);
                     if st7789_window_size.is_none() {
                         st7789_window_size = Some((usize::from(panel_width), usize::from(panel_height)));
                     }
                 }
-                BoardPeripheralConfig::UartTerminal {
-                    enabled,
+                PeripheralConfig::Uart {
                     usart,
                     tx,
                     rx,
-                    ..
                 } => {
-                    if !enabled {
-                        continue;
+                    if let (Some(tx), Some(rx)) = (tx, rx) {
+                        uart_bindings.push(UartTerminalBinding {
+                            usart: usart.clone(),
+                            tx: tx.clone(),
+                            rx: rx.clone(),
+                        });
                     }
-                    uart_bindings.push(UartTerminalBinding {
-                        usart: usart.clone(),
-                        tx: tx.clone(),
-                        rx: rx.clone(),
-                    });
                 }
-                BoardPeripheralConfig::Led {
+                PeripheralConfig::Led {
                     id,
-                    enabled,
                     pin,
                     active_low,
                 } => {
-                    if !enabled {
-                        continue;
-                    }
                     let led_id = id
                         .clone()
                         .unwrap_or_else(|| format!("{}{}", pin.port.to_ascii_uppercase(), pin.pin));
                     let port = pin.port.chars().next().unwrap_or('A').to_ascii_uppercase();
                     let led = Led::new(led_id.clone(), pin.clone(), *active_low);
-                    gpio_notifier.register(
+                    bus_ctx.register_gpio(
                         GpioPin::new(port, pin.pin),
                         Box::new(led),
                     );
-                    led_ids.push((led_id.clone(), port, pin.pin));
                     info!("bus.register LED {} → P{}{}", led_id, port, pin.pin);
                 }
+                _ => {}
             }
         }
-
-        // Also register ST7789 as GpioListener for its CS and DC pins
-        // (we do this via direct dispatch in the event loop since we need mutable access
-        //  to the same St7789 object, and GpioNotifier can't hold a reference to it)
 
         let mut uart_terminals = Vec::new();
         let mut stdin_rx = Some(spawn_stdin_reader());
@@ -334,6 +246,7 @@ fn run_with_cpu<C: CpuCore>(
         pacer.set_enabled(!args.fast_mode);
         let is_f407_target = target.name.to_ascii_uppercase().contains("F407");
         let mut clocks = RccClockModel::new(target.core_clock_hz, is_f407_target);
+        let mut step_batch = StepBatchController::new(1000);
         let heartbeat_interval = if args.fast_mode { 250_000u64 } else { 50_000u64 };
         let mut next_heartbeat_step = heartbeat_interval;
         let stream_interval_steps: u64 = if args.fast_mode { 4096 } else { 64 };
@@ -358,7 +271,7 @@ fn run_with_cpu<C: CpuCore>(
                 break;
             }
 
-            match step_cpu_resilient(&mut machine, 1000) {
+            match step_batch.step_cpu(&mut machine) {
                 Ok(ran) => {
                     steps += ran as u64;
                     steps_since_stream = steps_since_stream.saturating_add(ran as u64);
@@ -377,9 +290,7 @@ fn run_with_cpu<C: CpuCore>(
                             &mut serial_lines,
                             &mut clocks,
                             &mut pacer,
-                            &mut st7789_handles,
-                            &mut gpio_notifier,
-                            &led_ids,
+                            &mut bus_ctx,
                             &mut uart_terminals,
                             active_uart_filters.as_deref(),
                             &mut display_gui,
@@ -417,9 +328,7 @@ fn run_with_cpu<C: CpuCore>(
                 &mut serial_lines,
                 &mut clocks,
                 &mut pacer,
-                &mut st7789_handles,
-                &mut gpio_notifier,
-                &led_ids,
+                &mut bus_ctx,
                 &mut uart_terminals,
                 active_uart_filters.as_deref(),
                 &mut display_gui,
@@ -447,26 +356,7 @@ fn run_with_cpu<C: CpuCore>(
     Ok(())
 }
 
-fn step_cpu_resilient<C: CpuCore>(
-    machine: &mut Machine<C>,
-    preferred_batch: usize,
-) -> Result<u32, String> {
-    let mut last_err: Option<String> = None;
-    for batch in [preferred_batch, 10_000, 1_000, 100, 10, 1] {
-        match machine.step_cpu(batch) {
-            Ok(ran) => return Ok(ran),
-            Err(err) => {
-                if !err.contains(": MAP") && !err.contains(" MAP") {
-                    return Err(err);
-                }
-                last_err = Some(err);
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| "cpu.step failed".to_string()))
-}
-
-/// Dispatch events through the bus-device architecture.
+/// Dispatch events through BusContext.
 fn stream_new_events<C: CpuCore>(
     machine: &mut Machine<C>,
     serial_cursor: &mut usize,
@@ -474,9 +364,7 @@ fn stream_new_events<C: CpuCore>(
     serial_lines: &mut BTreeMap<String, Vec<u8>>,
     clocks: &mut RccClockModel,
     pacer: &mut RealtimePacer,
-    st7789_handles: &mut [St7789BusHandle],
-    gpio_notifier: &mut GpioNotifier,
-    led_ids: &[(String, char, u8)],
+    bus_ctx: &mut BusContext,
     uart_terminals: &mut [UartTerminalConsole],
     active_uart_filters: Option<&[String]>,
     display_gui: &mut Option<DisplayWindow>,
@@ -509,73 +397,14 @@ fn stream_new_events<C: CpuCore>(
     }
     *serial_cursor = serial_events.len();
 
-    // ── MMIO write events → bus routing ─────────────────────────────────
+    // ── MMIO write events → BusContext routing ──────────────────────────
     let mmio_events = machine.mmio_writes();
     for event in &mmio_events[*mmio_cursor..] {
-        let is_gpio = event.peripheral.starts_with("GPIO");
-        let is_spi_dr = event.peripheral.starts_with("SPI")
-            && event.register.eq_ignore_ascii_case("DR");
+        let _stats = bus_ctx.dispatch_mmio(event);
 
-        // Route SPI DR → ST7789 SpiSlave::transfer()
-        if is_spi_dr {
-            for handle in st7789_handles.iter_mut() {
-                if event.peripheral.eq_ignore_ascii_case(&handle.spi_peripheral) {
-                    let byte = (event.value & 0xFF) as u8;
-                    let _miso = SpiSlave::transfer(&mut handle.device, byte);
-                    // MISO data is ignored for ST7789 (write-only display)
-                }
-            }
-        }
-
-        // Route GPIO → GpioNotifier (LEDs) + ST7789 CS/DC pins
-        if is_gpio {
-            let port = gpio_port_letter(&event.peripheral).unwrap_or('A');
-            if event.register.eq_ignore_ascii_case("ODR") {
-                let val16 = (event.value & 0xFFFF) as u16;
-                // Dispatch to GpioNotifier (LEDs)
-                gpio_notifier.notify_mask_diff(port, 0, val16);
-                // Dispatch to ST7789 CS/DC pins
-                for handle in st7789_handles.iter_mut() {
-                    if port == handle.cs_port {
-                        let high = ((event.value >> handle.cs_pin) & 1) != 0;
-                        handle.device.chip_select(!high); // CS is active-low: pin LOW = selected
-                    }
-                    if port == handle.dc_port {
-                        let high = ((event.value >> handle.dc_pin) & 1) != 0;
-                        GpioListener::pin_changed(&mut handle.device, port, handle.dc_pin, high);
-                    }
-                }
-            } else if event.register.eq_ignore_ascii_case("BSRR") {
-                let set_mask = event.value & 0xFFFF;
-                let rst_mask = (event.value >> 16) & 0xFFFF;
-                // Dispatch individual pin changes to GpioNotifier
-                for pin in 0..16u8 {
-                    if (set_mask >> pin) & 1 != 0 {
-                        gpio_notifier.notify(port, pin, true);
-                    }
-                    if (rst_mask >> pin) & 1 != 0 {
-                        gpio_notifier.notify(port, pin, false);
-                    }
-                }
-                // Dispatch to ST7789 CS/DC pins
-                for handle in st7789_handles.iter_mut() {
-                    let cs_set = (set_mask >> handle.cs_pin) & 1 != 0;
-                    let cs_rst = (rst_mask >> handle.cs_pin) & 1 != 0;
-                    // CS is active-low: BSRR set → pin HIGH → NOT selected; reset → pin LOW → selected
-                    if cs_set { handle.device.chip_select(false); }
-                    if cs_rst { handle.device.chip_select(true); }
-
-                    let dc_set = (set_mask >> handle.dc_pin) & 1 != 0;
-                    let dc_rst = (rst_mask >> handle.dc_pin) & 1 != 0;
-                    if dc_set { GpioListener::pin_changed(&mut handle.device, port, handle.dc_pin, true); }
-                    if dc_rst { GpioListener::pin_changed(&mut handle.device, port, handle.dc_pin, false); }
-                }
-
-                // Log GPIO events (non-uart mode)
-                if !has_uart_terminals {
-                    println!("{}", format_gpio_event(event));
-                }
-            }
+        // Log GPIO events (non-uart mode)
+        if !has_uart_terminals && event.peripheral.starts_with("GPIO") {
+            println!("{}", format_gpio_event(event));
         }
 
         // RCC clock model
@@ -585,14 +414,13 @@ fn stream_new_events<C: CpuCore>(
             pacer.set_core_clock_hz(new_core_hz);
         }
     }
+    let _ = bus_ctx; // suppress unused warning if no devices
     *mmio_cursor = mmio_events.len();
 
     // ── Display frame capture ───────────────────────────────────────────
     if let Some(window) = display_gui.as_mut() {
-        for handle in st7789_handles.iter_mut() {
-            if let Some(frame) = handle.device.latest_frame() {
-                let _ = window.present(handle.device.width(), handle.device.height(), &frame);
-            }
+        for frame in bus_ctx.poll_frames() {
+            let _ = window.present(frame.width, frame.height, &frame.pixels);
         }
         if !window.tick() {
             info!("display.gui = closed");
@@ -611,12 +439,9 @@ fn stream_new_events<C: CpuCore>(
     machine.clear_outputs();
     *serial_cursor = 0;
     *mmio_cursor = 0;
-
-    // Suppress unused warning
-    let _ = led_ids;
 }
 
-fn format_gpio_event(event: &MmioWriteEvent) -> String {
+fn format_gpio_event(event: &rsemu_core::MmioWriteEvent) -> String {
     let base = format!(
         "gpio.{}.{} @ 0x{:08x} <= 0x{:08x}",
         event.peripheral, event.register, event.addr, event.value
@@ -640,13 +465,6 @@ fn format_gpio_event(event: &MmioWriteEvent) -> String {
         return format!("{base} (high: [{}])", high.join(", "));
     }
     base
-}
-
-fn gpio_port_letter(name: &str) -> Option<char> {
-    if !name.starts_with("GPIO") {
-        return None;
-    }
-    name.chars().nth(4)
 }
 
 fn mask_to_gpio_pins(port: char, mask: u32) -> Vec<String> {

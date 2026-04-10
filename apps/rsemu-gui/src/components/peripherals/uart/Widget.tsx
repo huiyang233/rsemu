@@ -1,10 +1,9 @@
 import React, { useRef, useEffect, useCallback } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { uartOutputBus } from "../../lib/tauri";
-import { sendUart } from "../../lib/tauri";
-import type { UartConfig } from "../../types/peripheral";
-import Button from "../ui/Button";
+import { uartOutputBus, sendUart } from "../../../lib/tauri";
+import type { UartConfig } from "../../../types/peripheral";
+import Button from "../../ui/Button";
 
 interface Props {
   config: UartConfig;

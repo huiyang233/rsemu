@@ -2,7 +2,7 @@ import { create } from "zustand";
 import type { BoardInfo } from "../types/board";
 import type { CanvasItem, PeripheralConfig } from "../types/peripheral";
 
-export type AppPage = "setup" | "simulation";
+export type AppPage = "welcome" | "setup" | "simulation";
 
 interface AppState {
   // ── Navigation ──────────────────────────────────────────────────────────
@@ -13,18 +13,29 @@ interface AppState {
   boards: BoardInfo[];
   setBoards: (boards: BoardInfo[]) => void;
 
+  projectPath: string | null;
+  projectName: string;
+  projectCreatedAt: string | null;
+  recentProjects: string[];
+  dirty: boolean;
+  setProjectMeta: (projectPath: string | null, projectName: string, createdAt?: string | null) => void;
+  setRecentProjects: (paths: string[]) => void;
+  setDirty: (dirty: boolean) => void;
+
   selectedBoard: string;
-  setSelectedBoard: (id: string) => void;
+  setSelectedBoard: (id: string, markDirty?: boolean) => void;
 
   firmwarePath: string;
-  setFirmwarePath: (path: string) => void;
+  setFirmwarePath: (path: string, markDirty?: boolean) => void;
 
   canvasItems: CanvasItem[];
-  addCanvasItem: (item: CanvasItem) => void;
-  removeCanvasItem: (instanceId: string) => void;
-  updateCanvasItem: (instanceId: string, updates: Partial<CanvasItem>) => void;
-  updateCanvasItemConfig: (instanceId: string, config: PeripheralConfig) => void;
-  moveCanvasItem: (instanceId: string, position: { x: number; y: number }) => void;
+  setCanvasItems: (items: CanvasItem[], markDirty?: boolean) => void;
+  clearCanvasItems: (markDirty?: boolean) => void;
+  addCanvasItem: (item: CanvasItem, markDirty?: boolean) => void;
+  removeCanvasItem: (instanceId: string, markDirty?: boolean) => void;
+  updateCanvasItem: (instanceId: string, updates: Partial<CanvasItem>, markDirty?: boolean) => void;
+  updateCanvasItemConfig: (instanceId: string, config: PeripheralConfig, markDirty?: boolean) => void;
+  moveCanvasItem: (instanceId: string, position: { x: number; y: number }, markDirty?: boolean) => void;
 
   // ── Simulation runtime ───────────────────────────────────────────────────
   running: boolean;
@@ -44,41 +55,63 @@ interface AppState {
 
 export const useAppStore = create<AppState>((set) => ({
   // ── Navigation ──────────────────────────────────────────────────────────
-  page: "setup",
+  page: "welcome",
   setPage: (page) => set({ page }),
 
   // ── Setup ────────────────────────────────────────────────────────────────
   boards: [],
   setBoards: (boards) => set({ boards }),
 
+  projectPath: null,
+  projectName: "",
+  projectCreatedAt: null,
+  recentProjects: [],
+  dirty: false,
+  setProjectMeta: (projectPath, projectName, createdAt = null) =>
+    set({ projectPath, projectName, projectCreatedAt: createdAt }),
+  setRecentProjects: (recentProjects) => set({ recentProjects }),
+  setDirty: (dirty) => set({ dirty }),
+
   selectedBoard: "stm32f103",
-  setSelectedBoard: (id) => set({ selectedBoard: id }),
+  setSelectedBoard: (id, markDirty = true) =>
+    set((s) => ({ selectedBoard: id, dirty: s.dirty || markDirty })),
 
   firmwarePath: "",
-  setFirmwarePath: (firmwarePath) => set({ firmwarePath }),
+  setFirmwarePath: (firmwarePath, markDirty = true) =>
+    set((s) => ({ firmwarePath, dirty: s.dirty || markDirty })),
 
   canvasItems: [],
-  addCanvasItem: (item) =>
-    set((s) => ({ canvasItems: [...s.canvasItems, item] })),
-  removeCanvasItem: (instanceId) =>
-    set((s) => ({ canvasItems: s.canvasItems.filter((i) => i.instanceId !== instanceId) })),
-  updateCanvasItem: (instanceId, updates) =>
+  setCanvasItems: (canvasItems, markDirty = true) =>
+    set((s) => ({ canvasItems, dirty: s.dirty || markDirty })),
+  clearCanvasItems: (markDirty = true) =>
+    set((s) => ({ canvasItems: [], dirty: s.dirty || markDirty })),
+  addCanvasItem: (item, markDirty = true) =>
+    set((s) => ({ canvasItems: [...s.canvasItems, item], dirty: s.dirty || markDirty })),
+  removeCanvasItem: (instanceId, markDirty = true) =>
+    set((s) => ({
+      canvasItems: s.canvasItems.filter((i) => i.instanceId !== instanceId),
+      dirty: s.dirty || markDirty,
+    })),
+  updateCanvasItem: (instanceId, updates, markDirty = true) =>
     set((s) => ({
       canvasItems: s.canvasItems.map((i) =>
         i.instanceId === instanceId ? { ...i, ...updates } : i
       ),
+      dirty: s.dirty || markDirty,
     })),
-  updateCanvasItemConfig: (instanceId, config) =>
+  updateCanvasItemConfig: (instanceId, config, markDirty = true) =>
     set((s) => ({
       canvasItems: s.canvasItems.map((i) =>
         i.instanceId === instanceId ? { ...i, config } : i
       ),
+      dirty: s.dirty || markDirty,
     })),
-  moveCanvasItem: (instanceId, position) =>
+  moveCanvasItem: (instanceId, position, markDirty = true) =>
     set((s) => ({
       canvasItems: s.canvasItems.map((i) =>
         i.instanceId === instanceId ? { ...i, position } : i
       ),
+      dirty: s.dirty || markDirty,
     })),
 
   // ── Simulation runtime ───────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 use rsemu_core::{
-    AccessWidth, GpioListener, ParallelDevice, SpiSlave,
+    AccessWidth, FrameUpdate, GpioListener, ParallelDevice, SpiSlave,
 };
 use tracing::info;
 use std::fs;
@@ -255,6 +255,24 @@ impl SpiSlave for St7789 {
         self.core.params.clear();
         self.core.pixel_hi = None;
     }
+
+    fn poll_frame(&mut self) -> Option<FrameUpdate> {
+        self.core.latest_frame().map(|pixels| FrameUpdate {
+            width: self.core.width,
+            height: self.core.height,
+            pixels,
+        })
+    }
+
+    fn gpio_pin_changed(&mut self, port: char, pin: u8, high: bool) {
+        let port_upper = port.to_ascii_uppercase();
+        if port_upper.to_string() == self.cs.port.to_ascii_uppercase() && pin == self.cs.pin {
+            self.core.cs_active = !high; // CS is active-low: pin LOW = selected
+        }
+        if port_upper.to_string() == self.dc.port.to_ascii_uppercase() && pin == self.dc.pin {
+            self.core.dc = high; // DC is active-high: pin HIGH = data mode
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +316,14 @@ impl ParallelDevice for St7789 {
         self.core.current_cmd = None;
         self.core.params.clear();
         self.core.pixel_hi = None;
+    }
+
+    fn poll_frame(&mut self) -> Option<FrameUpdate> {
+        self.core.latest_frame().map(|pixels| FrameUpdate {
+            width: self.core.width,
+            height: self.core.height,
+            pixels,
+        })
     }
 }
 

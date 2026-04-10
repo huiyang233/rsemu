@@ -99,99 +99,6 @@ impl WallClockStepPacer {
     }
 }
 
-struct StepBatchController {
-    current: usize,
-    grow_success: u8,
-}
-
-impl StepBatchController {
-    fn new(initial: usize) -> Self {
-        Self {
-            current: normalize_batch(initial),
-            grow_success: 0,
-        }
-    }
-
-    fn step_cpu<C: CpuCore>(&mut self, machine: &mut Machine<C>) -> Result<u32, String> {
-        let mut batch = self.current;
-        loop {
-            match machine.step_cpu(batch) {
-                Ok(ran) => {
-                    self.current = batch;
-                    if (ran as usize) >= batch {
-                        self.grow_success = self.grow_success.saturating_add(1);
-                        if self.grow_success >= 8 {
-                            self.current = next_larger_batch(self.current);
-                            self.grow_success = 0;
-                        }
-                    } else {
-                        self.grow_success = 0;
-                    }
-                    return Ok(ran);
-                }
-                Err(err) => {
-                    let retryable = err.contains(": MAP")
-                        || err.contains(" MAP")
-                        || err.contains("EXCEPTION");
-                    if !retryable {
-                        return Err(err);
-                    }
-                    self.grow_success = 0;
-                    let lower = next_smaller_batch(batch);
-                    if lower == batch {
-                        return Err(err);
-                    }
-                    batch = lower;
-                }
-            }
-        }
-    }
-}
-
-fn normalize_batch(v: usize) -> usize {
-    if v >= 10_000 {
-        10_000
-    } else if v >= 5_000 {
-        5_000
-    } else if v >= 1_000 {
-        1_000
-    } else if v >= 100 {
-        100
-    } else if v >= 10 {
-        10
-    } else {
-        1
-    }
-}
-
-fn next_smaller_batch(v: usize) -> usize {
-    if v > 5_000 {
-        5_000
-    } else if v > 1_000 {
-        1_000
-    } else if v > 100 {
-        100
-    } else if v > 10 {
-        10
-    } else {
-        1
-    }
-}
-
-fn next_larger_batch(v: usize) -> usize {
-    if v < 10 {
-        10
-    } else if v < 100 {
-        100
-    } else if v < 1_000 {
-        1_000
-    } else if v < 5_000 {
-        5_000
-    } else {
-        10_000
-    }
-}
-
 fn normalize_ssd1306_size(width: u16, height: u16) -> (u16, u16) {
     let w = match width {
         64 | 72 | 96 | 128 => width,
@@ -205,19 +112,19 @@ fn normalize_ssd1306_size(width: u16, height: u16) -> (u16, u16) {
 }
 
 use rsemu_core::{
-    CpuCore, FirmwareLoader, GpioListener, GpioNotifier, GpioPin, I2cSlave, Machine,
-    MmioWriteEvent, SpiSlave, TargetSpec,
+    BusContext, CpuCore, FirmwareLoader, GpioPin, I2cBus, Machine,
+    RccClockModel, SpiBus, StepBatchController, TargetSpec, gpio_idr_addr,
 };
 use rsemu_peripherals::display::St7789;
 use rsemu_peripherals::led::Led;
 use rsemu_peripherals::ssd1306::Ssd1306I2c;
+use rsemu_peripherals::{PeripheralConfig, PinMapping};
 use rsemu_targets::stm32::{f103, f407};
 use serde::Serialize;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use tauri::AppHandle;
 
-use crate::clock_model::RccClockModel;
-use crate::state::{ControlMsg, GuiPeripheralConfig, SimConfig};
+use crate::state::{ControlMsg, SimConfig};
 
 // ── Tauri event payloads ─────────────────────────────────────────────────────
 
@@ -255,133 +162,6 @@ struct EventProcessStats {
     serial_events: usize,
     mmio_events: usize,
     frame_encode_ns: u128,
-}
-
-// ── Bus-device context (replaces Vec<Box<dyn Peripheral>> + LedTracker) ─────
-
-/// Tracks which SPI peripheral an ST7789 display is connected to.
-struct St7789BusHandle {
-    spi_peripheral: String, // e.g. "SPI1"
-    cs_port: char,
-    cs_pin: u8,
-    dc_port: char,
-    dc_pin: u8,
-    device: St7789,
-}
-
-/// Tracks which I2C peripheral an SSD1306 OLED is connected to.
-/// Contains a minimal I2C protocol state machine (START/STOP/address/data)
-/// and routes events to the I2cSlave trait methods on the device.
-struct Ssd1306BusHandle {
-    i2c_peripheral: String, // e.g. "I2C1"
-    device: Ssd1306I2c,
-    i2c_phase: I2cPhase,
-}
-
-/// Minimal I2C master state for protocol routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum I2cPhase {
-    Idle,
-    AwaitAddress,
-    MasterWrite,
-}
-
-impl Ssd1306BusHandle {
-    fn on_cr1_write(&mut self, value: u32) {
-        // START condition
-        if (value & (1 << 8)) != 0 {
-            self.i2c_phase = I2cPhase::AwaitAddress;
-        }
-        // STOP condition
-        if (value & (1 << 9)) != 0 {
-            if self.i2c_phase != I2cPhase::Idle {
-                self.device.stop();
-            }
-            self.i2c_phase = I2cPhase::Idle;
-        }
-    }
-
-    fn on_dr_write(&mut self, byte: u8) {
-        match self.i2c_phase {
-            I2cPhase::AwaitAddress => {
-                let addr7 = byte >> 1;
-                let read = (byte & 1) != 0;
-                if self.device.address(addr7, read) && !read {
-                    self.i2c_phase = I2cPhase::MasterWrite;
-                } else {
-                    self.i2c_phase = I2cPhase::Idle;
-                }
-            }
-            I2cPhase::MasterWrite => {
-                self.device.write_byte(byte);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Tracks an LED connected to a GPIO pin, for Tauri event emission.
-struct LedHandle {
-    id: String,
-    port: char,
-    pin: u8,
-    active_low: bool,
-    level_high: bool,
-    last_on: Option<bool>,
-}
-
-impl LedHandle {
-    fn on_state(&self) -> bool {
-        if self.active_low { !self.level_high } else { self.level_high }
-    }
-
-    /// Process an MMIO event. Returns Some(true/false) if LED state changed.
-    fn process_mmio(&mut self, event: &MmioWriteEvent) -> Option<bool> {
-        // Check port match — event peripheral is like "GPIOA" or "A"
-        let port_matches = event.peripheral.eq_ignore_ascii_case(&format!("GPIO{}", self.port))
-            || event.peripheral.eq_ignore_ascii_case(&self.port.to_string());
-        if !port_matches {
-            return None;
-        }
-        if event.register.eq_ignore_ascii_case("ODR") {
-            self.level_high = ((event.value >> self.pin) & 1) != 0;
-        } else if event.register.eq_ignore_ascii_case("BSRR") {
-            let set = ((event.value >> self.pin) & 1) != 0;
-            let reset = ((event.value >> (self.pin + 16)) & 1) != 0;
-            if set { self.level_high = true; }
-            else if reset { self.level_high = false; }
-            else { return None; }
-        } else {
-            return None;
-        }
-        let on = self.on_state();
-        if self.last_on == Some(on) {
-            return None;
-        }
-        self.last_on = Some(on);
-        Some(on)
-    }
-}
-
-// ── GPIO IDR address helpers ─────────────────────────────────────────────────
-
-fn gpio_idr_addr(port: char, is_f407: bool) -> u64 {
-    let idx = port.to_ascii_uppercase() as u64 - b'A' as u64;
-    if is_f407 {
-        0x4002_0000 + idx * 0x400 + 0x10
-    } else {
-        0x4001_0800 + idx * 0x400 + 0x08
-    }
-}
-
-fn gpio_port_letter(name: &str) -> Option<char> {
-    if name.starts_with("GPIO") {
-        name.chars().nth(4)
-    } else if name.len() == 1 && name.chars().next().unwrap_or('\0').is_ascii_alphabetic() {
-        name.chars().next()
-    } else {
-        None
-    }
 }
 
 // ── Public entry point ───────────────────────────────────────────────────────
@@ -464,68 +244,70 @@ fn run_machine<C: CpuCore>(
     }
     eprintln!("[EMU] CPU reset complete. Initial PC: 0x{:08x}", machine.cpu().program_counter());
 
-    // ── Build bus-device context ───────────────────────────────────────────
-    let mut st7789_handles: Vec<St7789BusHandle> = Vec::new();
-    let mut ssd1306_handles: Vec<Ssd1306BusHandle> = Vec::new();
-    let mut led_handles: Vec<LedHandle> = Vec::new();
+    // ── Build BusContext ───────────────────────────────────────────────────
+    let mut bus_ctx = BusContext::new();
     let mut uart_peripherals: Vec<String> = Vec::new();
-    let mut gpio_notifier = GpioNotifier::new();
 
     eprintln!("[EMU] Initializing peripherals...");
     for (idx, pc) in config.peripherals.iter().enumerate() {
         match pc {
-            GuiPeripheralConfig::St7789 { width, height, spi_base, cs, dc, res } => {
-                eprintln!("[EMU]   [{}] ST7789 {}x{} SPI base 0x{:08x}", idx, width, height, spi_base);
+            PeripheralConfig::St7789Spi { width, height, spi_base, cs, dc, res } => {
+                eprintln!("[EMU]   [{}] ST7789(SPI) {}x{} base 0x{:08x}", idx, width, height, spi_base);
                 eprintln!("[EMU]        CS: P{}{}, DC: P{}{}", cs.port, cs.pin, dc.port, dc.pin);
                 let device = St7789::new(
                     *width, *height, *spi_base,
                     cs.clone(), dc.clone(), res.clone(),
-                    String::new(), false, true, // preview_enabled=true for debugging
+                    String::new(), false, true,
                 );
                 let cs_port = cs.port.chars().next().unwrap_or('A').to_ascii_uppercase();
                 let dc_port = dc.port.chars().next().unwrap_or('A').to_ascii_uppercase();
-                // Find which SPI peripheral by scanning target for SPI at spi_base
                 let spi_peripheral = target.peripherals.iter()
                     .find(|p| p.base_address == *spi_base)
                     .map(|p| p.name.to_ascii_uppercase())
                     .unwrap_or_else(|| format!("SPI{}", spi_base & 0xFFFF));
-                eprintln!("[EMU]        → {} (bus-device routing)", spi_peripheral);
-                st7789_handles.push(St7789BusHandle {
-                    spi_peripheral,
-                    cs_port,
-                    cs_pin: cs.pin,
-                    dc_port,
-                    dc_pin: dc.pin,
-                    device,
-                });
+                eprintln!("[EMU]        → {} (SPI routing)", spi_peripheral);
+                let spi_bus = SpiBus::new(Box::new(device));
+                let cs_pin = Some(GpioPin::new(cs_port, cs.pin));
+                let dc_pin = Some(GpioPin::new(dc_port, dc.pin));
+                bus_ctx.register_spi(spi_peripheral, spi_bus, cs_pin, dc_pin);
             }
-            GuiPeripheralConfig::Led { id, pin, active_low } => {
-                eprintln!("[EMU]   [{}] LED {} on P{}{} (active_low={})", idx, id, pin.port, pin.pin, active_low);
+            PeripheralConfig::St7789Fsmc { width, height, fsmc_base } => {
+                eprintln!("[EMU]   [{}] ST7789(FSMC) {}x{} base 0x{:08x}", idx, width, height, fsmc_base);
+                let device = St7789::new(
+                    *width, *height, *fsmc_base,
+                    PinMapping { port: "A".into(), pin: 0 },
+                    PinMapping { port: "A".into(), pin: 0 },
+                    None,
+                    String::new(), false, true,
+                );
+                let fsmc_bus = rsemu_core::FsmcBus::new(Box::new(device));
+                bus_ctx.register_fsmc(*fsmc_base, 0x0100_0000, fsmc_bus);
+            }
+            PeripheralConfig::Led { id, pin, active_low } => {
+                let led_id = id.clone().unwrap_or_else(|| format!("{}{}", pin.port.to_ascii_uppercase(), pin.pin));
+                eprintln!("[EMU]   [{}] LED {} on P{}{} (active_low={})", idx, led_id, pin.port, pin.pin, active_low);
                 let port = pin.port.chars().next().unwrap_or('A').to_ascii_uppercase();
-                // Register LED with GpioNotifier for GPIO dispatch
-                let led = Led::new(id.clone(), pin.clone(), *active_low);
-                gpio_notifier.register(
+                let app_clone = app.clone();
+                let led = Led::new(led_id, pin.clone(), *active_low)
+                    .with_callback(Box::new(move |led_id, on| {
+                        app_clone.emit("led-changed", LedChangedPayload {
+                            id: led_id.to_string(),
+                            on,
+                        }).ok();
+                    }));
+                bus_ctx.register_gpio(
                     GpioPin::new(port, pin.pin),
                     Box::new(led),
                 );
-                // Also keep a handle for Tauri event emission
-                led_handles.push(LedHandle {
-                    id: id.clone(),
-                    port,
-                    pin: pin.pin,
-                    active_low: *active_low,
-                    level_high: true,
-                    last_on: None,
-                });
             }
-            GuiPeripheralConfig::Uart { usart } => {
+            PeripheralConfig::Uart { usart, .. } => {
                 eprintln!("[EMU]   [{}] UART {}", idx, usart);
                 uart_peripherals.push(usart.clone());
             }
-            GuiPeripheralConfig::Button { id, pin } => {
+            PeripheralConfig::Button { id, pin } => {
                 eprintln!("[EMU]   [{}] Button {} on P{}{}", idx, id, pin.port, pin.pin);
             }
-            GuiPeripheralConfig::Ssd1306I2c {
+            PeripheralConfig::Ssd1306I2c {
                 width,
                 height,
                 i2c,
@@ -538,18 +320,15 @@ fn run_machine<C: CpuCore>(
                 );
                 let i2c_peripheral = i2c.to_ascii_uppercase();
                 let device = Ssd1306I2c::new(w, h, i2c.clone(), *address);
-                ssd1306_handles.push(Ssd1306BusHandle {
-                    i2c_peripheral,
-                    device,
-                    i2c_phase: I2cPhase::Idle,
-                });
+                let i2c_bus = I2cBus::new(Box::new(device));
+                bus_ctx.register_i2c(i2c_peripheral, i2c_bus);
             }
         }
     }
 
-    let has_display = !st7789_handles.is_empty() || !ssd1306_handles.is_empty();
-    eprintln!("[EMU] Peripherals initialized: {} ST7789, {} SSD1306, {} LEDs, {} UARTs",
-        st7789_handles.len(), ssd1306_handles.len(), led_handles.len(), uart_peripherals.len());
+    let has_display = bus_ctx.has_bus_devices();
+    eprintln!("[EMU] Peripherals initialized: has_display={}, {} UARTs",
+        has_display, uart_peripherals.len());
 
     // Realtime + UnlockedRender:
     // - CPU loop runs as fast as possible
@@ -592,7 +371,7 @@ fn run_machine<C: CpuCore>(
 
     // UART batching: collect bytes and send in batches
     let mut uart_batch: Vec<(String, u8)> = Vec::new();
-    let uart_batch_size = 64; // Send batch every 64 bytes
+    let uart_batch_size = 64;
 
     // Realtime + UnlockedRender: keep real-time pacing, but emit frames by wall-clock.
     let frame_interval = Duration::from_millis(16);
@@ -665,10 +444,7 @@ fn run_machine<C: CpuCore>(
                         &mut machine,
                         &mut serial_cursor,
                         &mut mmio_cursor,
-                        &mut st7789_handles,
-                        &mut ssd1306_handles,
-                        &mut gpio_notifier,
-                        &mut led_handles,
+                        &mut bus_ctx,
                         &uart_peripherals,
                         has_display,
                         &app,
@@ -749,15 +525,12 @@ fn run_machine<C: CpuCore>(
     }
 }
 
-/// Dispatch events through the bus-device architecture.
+/// Dispatch events through BusContext.
 fn process_events<C: CpuCore>(
     machine: &mut Machine<C>,
     serial_cursor: &mut usize,
     mmio_cursor: &mut usize,
-    st7789_handles: &mut [St7789BusHandle],
-    ssd1306_handles: &mut [Ssd1306BusHandle],
-    gpio_notifier: &mut GpioNotifier,
-    led_handles: &mut [LedHandle],
+    bus_ctx: &mut BusContext,
     uart_peripherals: &[String],
     has_display: bool,
     app: &AppHandle,
@@ -788,104 +561,13 @@ fn process_events<C: CpuCore>(
         }
     }
 
-    // ── MMIO write events → bus routing ─────────────────────────────────
+    // ── MMIO write events → BusContext routing ──────────────────────────
     let mmio = machine.mmio_writes();
     stats.mmio_events = mmio.len().saturating_sub(*mmio_cursor);
     for event in &mmio[*mmio_cursor..] {
-        let is_gpio = event.peripheral.starts_with("GPIO")
-            || (event.peripheral.len() == 1 && event.peripheral.chars().next().unwrap_or('\0').is_ascii_alphabetic());
-        let is_spi_dr = event.peripheral.starts_with("SPI")
-            && event.register.eq_ignore_ascii_case("DR");
-        let is_i2c_dr = event.peripheral.starts_with("I2C")
-            && event.register.eq_ignore_ascii_case("DR");
-        let is_i2c_cr1 = event.peripheral.starts_with("I2C")
-            && event.register.eq_ignore_ascii_case("CR1");
-
-        // Track display activity for pacer decision
-        if has_display && (is_spi_dr || is_i2c_dr) {
+        let bus_stats = bus_ctx.dispatch_mmio(event);
+        if has_display && bus_stats.display_activity {
             stats.display_activity = true;
-        }
-
-        // Route SPI DR → ST7789 SpiSlave::transfer()
-        if is_spi_dr {
-            for handle in st7789_handles.iter_mut() {
-                if event.peripheral.eq_ignore_ascii_case(&handle.spi_peripheral) {
-                    let byte = (event.value & 0xFF) as u8;
-                    let _miso = SpiSlave::transfer(&mut handle.device, byte);
-                }
-            }
-        }
-
-        // Route I2C CR1/DR → SSD1306 I2C protocol state machine
-        if is_i2c_cr1 {
-            for handle in ssd1306_handles.iter_mut() {
-                if event.peripheral.eq_ignore_ascii_case(&handle.i2c_peripheral) {
-                    handle.on_cr1_write(event.value);
-                }
-            }
-        }
-        if is_i2c_dr {
-            for handle in ssd1306_handles.iter_mut() {
-                if event.peripheral.eq_ignore_ascii_case(&handle.i2c_peripheral) {
-                    let byte = (event.value & 0xFF) as u8;
-                    handle.on_dr_write(byte);
-                }
-            }
-        }
-
-        // Route GPIO → GpioNotifier (LEDs via trait) + ST7789 CS/DC pins
-        if is_gpio {
-            let port = gpio_port_letter(&event.peripheral).unwrap_or('A');
-            if event.register.eq_ignore_ascii_case("ODR") {
-                let val16 = (event.value & 0xFFFF) as u16;
-                // Dispatch to GpioNotifier (LEDs)
-                gpio_notifier.notify_mask_diff(port, 0, val16);
-                // Dispatch to ST7789 CS/DC pins
-                for handle in st7789_handles.iter_mut() {
-                    if port == handle.cs_port {
-                        let high = ((event.value >> handle.cs_pin) & 1) != 0;
-                        handle.device.chip_select(!high); // CS is active-low: pin LOW = selected
-                    }
-                    if port == handle.dc_port {
-                        let high = ((event.value >> handle.dc_pin) & 1) != 0;
-                        GpioListener::pin_changed(&mut handle.device, port, handle.dc_pin, high);
-                    }
-                }
-            } else if event.register.eq_ignore_ascii_case("BSRR") {
-                let set_mask = event.value & 0xFFFF;
-                let rst_mask = (event.value >> 16) & 0xFFFF;
-                // Dispatch individual pin changes to GpioNotifier
-                for pin in 0..16u8 {
-                    if (set_mask >> pin) & 1 != 0 {
-                        gpio_notifier.notify(port, pin, true);
-                    }
-                    if (rst_mask >> pin) & 1 != 0 {
-                        gpio_notifier.notify(port, pin, false);
-                    }
-                }
-                // Dispatch to ST7789 CS/DC pins
-                for handle in st7789_handles.iter_mut() {
-                    let cs_set = (set_mask >> handle.cs_pin) & 1 != 0;
-                    let cs_rst = (rst_mask >> handle.cs_pin) & 1 != 0;
-                    // CS is active-low: BSRR set → pin HIGH → NOT selected; reset → pin LOW → selected
-                    if cs_set { handle.device.chip_select(false); }
-                    if cs_rst { handle.device.chip_select(true); }
-
-                    let dc_set = (set_mask >> handle.dc_pin) & 1 != 0;
-                    let dc_rst = (rst_mask >> handle.dc_pin) & 1 != 0;
-                    if dc_set { GpioListener::pin_changed(&mut handle.device, port, handle.dc_pin, true); }
-                    if dc_rst { GpioListener::pin_changed(&mut handle.device, port, handle.dc_pin, false); }
-                }
-            }
-            // Update LED handles for Tauri event emission
-            for led in led_handles.iter_mut() {
-                if let Some(on) = led.process_mmio(event) {
-                    app.emit("led-changed", LedChangedPayload {
-                        id: led.id.clone(),
-                        on,
-                    }).ok();
-                }
-            }
         }
 
         // RCC/STK clock model
@@ -901,37 +583,18 @@ fn process_events<C: CpuCore>(
     if Instant::now() >= *next_frame_deadline {
         *next_frame_deadline = Instant::now() + frame_interval;
         if has_display {
-            // ST7789 displays
-            for handle in st7789_handles.iter_mut() {
-                if let Some(frame) = handle.device.latest_frame() {
-                    stats.frame_emitted = true;
-                    let frame_encode_begin = Instant::now();
-                    let data = encode_argb_frame_base64(&frame);
-                    stats.frame_encode_ns = stats
-                        .frame_encode_ns
-                        .saturating_add(frame_encode_begin.elapsed().as_nanos());
-                    app.emit("display-frame", DisplayFramePayload {
-                        width: handle.device.width(),
-                        height: handle.device.height(),
-                        data,
-                    }).ok();
-                }
-            }
-            // SSD1306 displays
-            for handle in ssd1306_handles.iter_mut() {
-                if let Some(frame) = handle.device.latest_frame() {
-                    stats.frame_emitted = true;
-                    let frame_encode_begin = Instant::now();
-                    let data = encode_argb_frame_base64(&frame);
-                    stats.frame_encode_ns = stats
-                        .frame_encode_ns
-                        .saturating_add(frame_encode_begin.elapsed().as_nanos());
-                    app.emit("display-frame", DisplayFramePayload {
-                        width: handle.device.width(),
-                        height: handle.device.height(),
-                        data,
-                    }).ok();
-                }
+            for frame in bus_ctx.poll_frames() {
+                stats.frame_emitted = true;
+                let frame_encode_begin = Instant::now();
+                let data = encode_argb_frame_base64(&frame.pixels);
+                stats.frame_encode_ns = stats
+                    .frame_encode_ns
+                    .saturating_add(frame_encode_begin.elapsed().as_nanos());
+                app.emit("display-frame", DisplayFramePayload {
+                    width: frame.width,
+                    height: frame.height,
+                    data,
+                }).ok();
             }
         }
     }
@@ -945,8 +608,6 @@ fn process_events<C: CpuCore>(
 
 fn encode_argb_frame_base64(frame: &[u32]) -> String {
     if cfg!(target_endian = "little") {
-        // ARGB u32 pixels are already little-endian in memory on all
-        // supported host targets (x86_64/aarch64), so encode in-place.
         let raw = unsafe {
             std::slice::from_raw_parts(
                 frame.as_ptr() as *const u8,

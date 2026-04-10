@@ -1,13 +1,26 @@
 use crate::PinMapping;
 use rsemu_core::GpioListener;
 
-#[derive(Debug)]
 pub struct Led {
     id: String,
     pin: PinMapping,
     active_low: bool,
     level_high: bool,
     last_on: Option<bool>,
+    #[allow(clippy::type_complexity)]
+    on_change: Option<Box<dyn FnMut(&str, bool) + Send>>,
+}
+
+impl std::fmt::Debug for Led {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Led")
+            .field("id", &self.id)
+            .field("pin", &self.pin)
+            .field("active_low", &self.active_low)
+            .field("level_high", &self.level_high)
+            .field("last_on", &self.last_on)
+            .finish()
+    }
 }
 
 impl Led {
@@ -18,7 +31,14 @@ impl Led {
             active_low,
             level_high: true,
             last_on: None,
+            on_change: None,
         }
+    }
+
+    /// Attach a callback invoked when the LED state changes: `callback(id, on)`.
+    pub fn with_callback(mut self, cb: Box<dyn FnMut(&str, bool) + Send>) -> Self {
+        self.on_change = Some(cb);
+        self
     }
 
     fn on_state(&self) -> bool {
@@ -42,6 +62,9 @@ impl Led {
         self.last_on = Some(on);
         let state = if on { "on" } else { "off" };
         eprintln!("led.{} = {} ({})", self.id, state, self.pin_name());
+        if let Some(cb) = &mut self.on_change {
+            cb(&self.id, on);
+        }
     }
 }
 

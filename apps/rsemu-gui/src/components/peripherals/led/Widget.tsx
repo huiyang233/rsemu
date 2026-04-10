@@ -1,13 +1,13 @@
 import React from "react";
-import { useAppStore } from "../../store/appStore";
-import type { LedConfig } from "../../types/peripheral";
+import { useAppStore } from "../../../store/appStore";
+import type { LedConfig } from "../../../types/peripheral";
 
 interface Props {
   config: LedConfig;
 }
 
 export default function LedWidget({ config }: Props) {
-  const on = useAppStore((s) => s.ledStates[config.id] ?? false);
+  const on = useAppStore((s) => s.ledStates[config.id ?? ""] ?? false);
 
   return (
     <div className="flex flex-col items-center gap-2 p-3 bg-[#2a2a3e] rounded-lg border border-[#3a3a5e] w-28">

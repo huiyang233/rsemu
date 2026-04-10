@@ -2,6 +2,7 @@ mod access;
 mod adc_dac;
 mod dma;
 mod fsmc_bus;
+mod bus_context;
 mod gpio;
 mod i2c_bus;
 mod spi_bus;
@@ -18,6 +19,7 @@ pub use access::{AccessWidth, CanFrame};
 pub use adc_dac::{
     AdcPeripheral, DacPeripheral, FixedAnalogSource, NoiseAnalogSource, SineAnalogSource,
 };
+pub use bus_context::{BusContext, BusContextStats};
 pub use dma::{
     DmaController, DmaDataWidth, DmaDirection, DmaStreamConfig, DmaTransfer,
 };

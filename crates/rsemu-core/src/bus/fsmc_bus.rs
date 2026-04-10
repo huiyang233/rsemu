@@ -43,6 +43,11 @@ impl FsmcBus {
         self.device.reset();
     }
 
+    /// Access the underlying device (for frame polling, etc.).
+    pub fn device_mut(&mut self) -> &mut dyn ParallelDevice {
+        self.device.as_mut()
+    }
+
     fn fire_irq(&mut self) {
         if let (Some(cb), Some(irq)) = (&self.irq_callback, self.irq_number) {
             cb(irq);

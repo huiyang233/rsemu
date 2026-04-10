@@ -13,21 +13,24 @@ pub struct PinMapping {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PeripheralConfig {
-    #[serde(rename = "st7789")]
-    St7789 {
+    #[serde(rename = "st7789_spi", alias = "st7789")]
+    St7789Spi {
         width: u16,
         height: u16,
         spi_base: u64,
         cs: PinMapping,
         dc: PinMapping,
         res: Option<PinMapping>,
-        #[serde(default)]
-        dump_frames: bool,
-        #[serde(default = "default_output_dir")]
-        output_dir: String,
+    },
+    #[serde(rename = "st7789_fsmc")]
+    St7789Fsmc {
+        width: u16,
+        height: u16,
+        fsmc_base: u64,
     },
     #[serde(rename = "led")]
     Led {
+        #[serde(default)]
         id: Option<String>,
         pin: PinMapping,
         #[serde(default = "default_true")]
@@ -41,10 +44,19 @@ pub enum PeripheralConfig {
         #[serde(default = "default_ssd1306_addr")]
         address: u8,
     },
-}
-
-fn default_output_dir() -> String {
-    "/tmp/rsemu-frames".to_string()
+    #[serde(rename = "uart")]
+    Uart {
+        usart: String,
+        #[serde(default)]
+        tx: Option<PinMapping>,
+        #[serde(default)]
+        rx: Option<PinMapping>,
+    },
+    #[serde(rename = "button")]
+    Button {
+        id: String,
+        pin: PinMapping,
+    },
 }
 
 fn default_true() -> bool {

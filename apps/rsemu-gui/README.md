@@ -14,6 +14,7 @@ rsemu 的图形化调试界面，基于 Tauri 2 + React + TypeScript 构建。�
 | 一键运行 | 后台线程启动模拟器，实时推送事件到前端 |
 | LED 显示 | GPIO ODR/BSRR 变化实时反映到 LED 图标亮灭 |
 | ST7789 屏幕 | SPI 帧解码后渲染到 Canvas 元素 |
+| SSD1306 屏幕 | I2C 帧解码后渲染到 Canvas 元素 |
 | UART 终端 | 收发串口数据，内嵌终端面板 |
 | Button 输入 | 点击按下/松开，注入 GPIO IDR 电平 |
 
@@ -86,6 +87,7 @@ apps/rsemu-gui/
 │   │   └── peripherals/          # 仿真页外设 widget
 │   │       ├── LedWidget.tsx     # LED 亮灭指示
 │   │       ├── DisplayWidget.tsx # ST7789 屏幕渲染
+│   │       ├── Ssd1306Widget.tsx # SSD1306(I2C) 屏幕渲染
 │   │       ├── UartTerminal.tsx  # 串口终端
 │   │       └── ButtonWidget.tsx  # 可交互按钮
 │   │
@@ -175,7 +177,7 @@ npm run tauri build
 
 5. 仿真页实时查看
    └─ LED 亮灭状态
-   └─ ST7789 屏幕渲染
+   └─ ST7789 / SSD1306 屏幕渲染
    └─ UART 终端输出 / 发送数据
    └─ 点击 Button 注入 GPIO 输入
 
@@ -198,7 +200,7 @@ invoke("start_simulation") ──► spawn thread ──────────
                                                            ├─ step_cpu()
                                                            ├─ 处理 MMIO 事件
                                                            │   ├─ LED 状态变化 ──► emit("led-changed")
-                                                           │   ├─ ST7789 新帧  ──► emit("display-frame")
+                                                           │   ├─ 显示新帧(ST7789/SSD1306) ──► emit("display-frame")
                                                            │   └─ UART 输出    ──► emit("uart-output")
                                                            └─ 检查控制消息
                                                                ├─ Stop
@@ -223,7 +225,7 @@ invoke("start_simulation") ──► spawn thread ──────────
 |------|---------|---------|
 | `sim-status` | `{ steps, running, error? }` | 模拟器启动/停止/出错 |
 | `led-changed` | `{ id, on }` | GPIO ODR/BSRR 导致 LED 状态变化 |
-| `display-frame` | `{ width, height, data }` | ST7789 产出新帧（base64 ARGB） |
+| `display-frame` | `{ width, height, data }` | ST7789/SSD1306 产出新帧（base64 ARGB） |
 | `uart-output` | `{ peripheral, byte }` | USART TX 输出一个字节 |
 | `sim-steps` | `number` | 定期步数更新 |
 

@@ -15,6 +15,14 @@ pub fn run() {
             commands::inject_gpio,
             commands::send_uart,
             commands::open_firmware_dialog,
+            commands::get_app_preferences,
+            commands::remember_project,
+            commands::forget_project,
+            commands::clear_last_project,
+            commands::open_project_dialog,
+            commands::save_project_dialog,
+            commands::read_project_file,
+            commands::write_project_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

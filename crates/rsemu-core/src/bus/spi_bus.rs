@@ -56,9 +56,14 @@ impl SpiBus {
         self.rx_latch = None;
     }
 
-    /// Access the underlying device (for GPIO listener passthrough, etc.).
+    /// Access the underlying device (for frame polling, etc.).
     pub fn device_mut(&mut self) -> &mut dyn SpiSlave {
         self.device.as_mut()
+    }
+
+    /// Forward a GPIO pin change to the device (e.g., DC/RS pin).
+    pub fn on_gpio_pin_changed(&mut self, port: char, pin: u8, high: bool) {
+        self.device.gpio_pin_changed(port, pin, high);
     }
 
     fn fire_irq(&mut self) {

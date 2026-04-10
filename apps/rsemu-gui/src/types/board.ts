@@ -11,5 +11,7 @@ export interface BoardInfo {
   ram_kb: number;
   gpio_ports: string[];
   spi_peripherals: BusPeripheralInfo[];
+  i2c_peripherals: BusPeripheralInfo[];
   usart_peripherals: BusPeripheralInfo[];
+  fsmc_peripherals: BusPeripheralInfo[];
 }

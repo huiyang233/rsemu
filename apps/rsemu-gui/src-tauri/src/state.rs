@@ -1,4 +1,4 @@
-use rsemu_peripherals::PinMapping;
+use rsemu_peripherals::PeripheralConfig;
 use serde::Deserialize;
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
@@ -23,39 +23,5 @@ pub struct SimState {
 pub struct SimConfig {
     pub board: String,
     pub firmware_path: String,
-    pub peripherals: Vec<GuiPeripheralConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
-pub enum GuiPeripheralConfig {
-    #[serde(rename = "st7789")]
-    St7789 {
-        width: u16,
-        height: u16,
-        spi_base: u64,
-        cs: PinMapping,
-        dc: PinMapping,
-        res: Option<PinMapping>,
-    },
-    #[serde(rename = "led")]
-    Led {
-        id: String,
-        pin: PinMapping,
-        #[serde(default = "default_true")]
-        active_low: bool,
-    },
-    #[serde(rename = "uart")]
-    Uart {
-        usart: String,
-    },
-    #[serde(rename = "button")]
-    Button {
-        id: String,
-        pin: PinMapping,
-    },
-}
-
-fn default_true() -> bool {
-    true
+    pub peripherals: Vec<PeripheralConfig>,
 }

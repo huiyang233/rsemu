@@ -1,6 +1,6 @@
 import React, { useCallback, useState } from "react";
-import { injectGpio } from "../../lib/tauri";
-import type { ButtonConfig } from "../../types/peripheral";
+import { injectGpio } from "../../../lib/tauri";
+import type { ButtonConfig } from "../../../types/peripheral";
 
 interface Props {
   config: ButtonConfig;
