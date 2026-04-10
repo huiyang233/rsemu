@@ -40,11 +40,20 @@ pub struct PeripheralSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CpuType {
+    CortexM3,
+    CortexM4,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetSpec {
     pub name: String,
     pub architecture: ArchitectureId,
+    pub cpu_type: CpuType,
     pub vector_table_base: u64,
     pub core_clock_hz: u32,
+    pub hsi_hz: u32,
+    pub has_pllcfgr: bool,
     pub systick_reload_divider: u32,
     pub memory_map: Vec<MemoryRegion>,
     pub peripherals: Vec<PeripheralSpec>,

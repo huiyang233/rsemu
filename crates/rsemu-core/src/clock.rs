@@ -5,7 +5,7 @@ use crate::MmioWriteEvent;
 /// Extracted from CLI/GUI duplicated implementations.
 #[derive(Debug, Clone)]
 pub struct RccClockModel {
-    is_f407: bool,
+    has_pllcfgr: bool,
     cr: u32,
     cfgr: u32,
     pllcfgr: u32,
@@ -16,14 +16,14 @@ pub struct RccClockModel {
 }
 
 impl RccClockModel {
-    pub fn new(initial_core_hz: u32, is_f407: bool) -> Self {
+    pub fn new(initial_core_hz: u32, hsi_hz: u32, has_pllcfgr: bool) -> Self {
         Self {
-            is_f407,
+            has_pllcfgr,
             cr: 0x0000_0083,
             cfgr: 0x0000_0000,
             pllcfgr: 0x2400_3010,
             systick_load: 0,
-            hsi_hz: if is_f407 { 16_000_000 } else { 8_000_000 },
+            hsi_hz,
             hse_hz: 8_000_000,
             core_clock_hz: initial_core_hz.max(1),
         }
@@ -45,7 +45,7 @@ impl RccClockModel {
             "CFGR" => {
                 self.cfgr = merge_mmio_write(self.cfgr, event);
             }
-            "PLLCFGR" if self.is_f407 => {
+            "PLLCFGR" if self.has_pllcfgr => {
                 self.pllcfgr = merge_mmio_write(self.pllcfgr, event);
             }
             _ => return None,
@@ -84,7 +84,7 @@ impl RccClockModel {
     }
 
     fn compute_core_clock_hz(&self) -> u32 {
-        if self.is_f407 {
+        if self.has_pllcfgr {
             return self.compute_core_clock_hz_f407();
         }
         self.compute_core_clock_hz_f1()

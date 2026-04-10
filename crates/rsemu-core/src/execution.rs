@@ -1,4 +1,5 @@
 use crate::cpu::CpuCore;
+use crate::target::PeripheralSpec;
 use crate::Machine;
 
 /// Adaptive CPU step batch controller with retry and auto-growth.
@@ -90,11 +91,18 @@ pub fn gpio_port_letter(name: &str) -> Option<char> {
 }
 
 /// Compute the GPIO IDR register address for a given port.
-pub fn gpio_idr_addr(port: char, is_f407: bool) -> u64 {
+/// Derives the GPIO base address and IDR register offset from the SVD peripheral list.
+pub fn gpio_idr_addr(port: char, peripherals: &[PeripheralSpec]) -> u64 {
     let idx = port.to_ascii_uppercase() as u64 - b'A' as u64;
-    if is_f407 {
-        0x4002_0000 + idx * 0x400 + 0x10
-    } else {
-        0x4001_0800 + idx * 0x400 + 0x08
-    }
+    let gpioa = peripherals
+        .iter()
+        .find(|p| p.name == "GPIOA")
+        .expect("GPIOA not found in target spec");
+    let idr = gpioa
+        .registers
+        .iter()
+        .find(|r| r.name == "IDR")
+        .expect("IDR register not found in GPIOA");
+    let idr_offset = idr.address - gpioa.base_address;
+    gpioa.base_address + idx * 0x400 + idr_offset
 }

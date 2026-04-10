@@ -23,5 +23,6 @@ pub use image::{FirmwareFormat, FirmwareLoader};
 pub use machine::{Machine, MachineBusInterface, MmioWriteEvent, SerialEvent};
 pub use memory::{FirmwareImage, MemoryBlock};
 pub use target::{
-    MemoryRegion, MemoryRegionKind, PeripheralSpec, RegisterSpec, RegisterValueSet, TargetSpec,
+    CpuType, MemoryRegion, MemoryRegionKind, PeripheralSpec, RegisterSpec, RegisterValueSet,
+    TargetSpec,
 };

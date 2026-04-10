@@ -1,4 +1,4 @@
-use rsemu_core::{ArchitectureId, MemoryRegion, MemoryRegionKind, TargetSpec};
+use rsemu_core::{ArchitectureId, CpuType, MemoryRegion, MemoryRegionKind, TargetSpec};
 use rsemu_svd::parse_svd;
 
 pub fn load_target(svd_xml: Option<&str>) -> Result<TargetSpec, String> {
@@ -25,8 +25,11 @@ pub fn load_target(svd_xml: Option<&str>) -> Result<TargetSpec, String> {
     Ok(TargetSpec {
         name: "STM32F407".to_string(),
         architecture: ArchitectureId::ArmV7M,
+        cpu_type: CpuType::CortexM4,
         vector_table_base: 0x0800_0000,
         core_clock_hz: 16_000_000,
+        hsi_hz: 16_000_000,
+        has_pllcfgr: true,
         systick_reload_divider: 1024,
         memory_map: vec![
             MemoryRegion {

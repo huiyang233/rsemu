@@ -3,7 +3,7 @@ use minifb::{Key, Scale, Window, WindowOptions};
 use rsemu_core::cpu::armv7em::CortexM4;
 use rsemu_core::cpu::armv7m::CortexM3;
 use rsemu_core::{
-    BusContext, CpuCore, FirmwareLoader, GpioPin, Machine, RccClockModel,
+    BusContext, CpuCore, CpuType, FirmwareLoader, GpioPin, Machine, RccClockModel,
     SpiBus, StepBatchController, TargetSpec, gpio_port_letter,
 };
 use rsemu_peripherals::display::St7789;
@@ -28,10 +28,6 @@ pub fn run() -> Result<(), String> {
         board.svd.as_deref(),
     ))?;
 
-    let is_f407 = matches!(
-        board.target.as_deref(),
-        Some("STM32F407") | Some("f407") | Some("stm32f407")
-    );
     let mut target = match board.target.as_deref() {
         Some("STM32F407") | Some("f407") | Some("stm32f407") => f407::load_target(svd_xml.as_deref())?,
         _ => f103::load_target(svd_xml.as_deref())?,
@@ -43,12 +39,15 @@ pub fn run() -> Result<(), String> {
     let firmware_path = resolve_path(&args.board_path, board.firmware.as_deref());
     let cycle_scale = board.cycle_scale.unwrap_or(1).max(1);
 
-    if is_f407 {
-        let machine = Machine::new(CortexM4::new(), target.clone());
-        run_with_cpu(machine, target, &args, &board, firmware_path, cycle_scale)
-    } else {
-        let machine = Machine::new(CortexM3::new(), target.clone());
-        run_with_cpu(machine, target, &args, &board, firmware_path, cycle_scale)
+    match target.cpu_type {
+        CpuType::CortexM4 => {
+            let machine = Machine::new(CortexM4::new(), target.clone());
+            run_with_cpu(machine, target, &args, &board, firmware_path, cycle_scale)
+        }
+        CpuType::CortexM3 => {
+            let machine = Machine::new(CortexM3::new(), target.clone());
+            run_with_cpu(machine, target, &args, &board, firmware_path, cycle_scale)
+        }
     }
 }
 
@@ -244,8 +243,7 @@ fn run_with_cpu<C: CpuCore>(
         let mut serial_lines: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut pacer = RealtimePacer::new(target.core_clock_hz, emu_cycles_per_step);
         pacer.set_enabled(!args.fast_mode);
-        let is_f407_target = target.name.to_ascii_uppercase().contains("F407");
-        let mut clocks = RccClockModel::new(target.core_clock_hz, is_f407_target);
+        let mut clocks = RccClockModel::new(target.core_clock_hz, target.hsi_hz, target.has_pllcfgr);
         let mut step_batch = StepBatchController::new(1000);
         let heartbeat_interval = if args.fast_mode { 250_000u64 } else { 50_000u64 };
         let mut next_heartbeat_step = heartbeat_interval;

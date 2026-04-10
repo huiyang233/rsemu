@@ -112,7 +112,7 @@ fn normalize_ssd1306_size(width: u16, height: u16) -> (u16, u16) {
 }
 
 use rsemu_core::{
-    BusContext, CpuCore, FirmwareLoader, GpioPin, I2cBus, Machine,
+    BusContext, CpuCore, CpuType, FirmwareLoader, GpioPin, I2cBus, Machine,
     RccClockModel, SpiBus, StepBatchController, TargetSpec, gpio_idr_addr,
 };
 use rsemu_peripherals::display::St7789;
@@ -174,8 +174,8 @@ pub fn run_emulator(config: SimConfig, app: AppHandle, control_rx: Receiver<Cont
         eprintln!("[EMU]   [{}] {:?}", i, p);
     }
 
-    let is_f407 = config.board == "stm32f407";
-    let target = match if is_f407 {
+    let is_f407_board = config.board == "stm32f407";
+    let target = match if is_f407_board {
         f407::load_target(Some(SVD_F407))
     } else {
         f103::load_target(Some(SVD_F103))
@@ -191,10 +191,10 @@ pub fn run_emulator(config: SimConfig, app: AppHandle, control_rx: Receiver<Cont
         }
     };
 
-    if is_f407 {
-        run_machine(CortexM4::new(), target, config, app, control_rx, true);
-    } else {
-        run_machine(CortexM3::new(), target, config, app, control_rx, false);
+    let peripherals = target.peripherals.clone();
+    match target.cpu_type {
+        CpuType::CortexM4 => run_machine(CortexM4::new(), target, config, app, control_rx, &peripherals),
+        CpuType::CortexM3 => run_machine(CortexM3::new(), target, config, app, control_rx, &peripherals),
     }
 }
 
@@ -206,11 +206,13 @@ fn run_machine<C: CpuCore>(
     config: SimConfig,
     app: AppHandle,
     control_rx: Receiver<ControlMsg>,
-    is_f407: bool,
+    target_peripherals: &[rsemu_core::PeripheralSpec],
 ) {
     // Extract values needed for pacer before moving target into Machine
     let core_clock_hz = target.core_clock_hz;
     let systick_reload_divider = target.systick_reload_divider;
+    let hsi_hz = target.hsi_hz;
+    let has_pllcfgr = target.has_pllcfgr;
 
     let mut machine = Machine::new(cpu, target.clone());
 
@@ -342,7 +344,7 @@ fn run_machine<C: CpuCore>(
     let mut step_pacer = Some(WallClockStepPacer::new(core_clock_hz, systick_reload_divider));
     let mut step_batch = StepBatchController::new(1_000);
     let mut can_disable_pacer_for_display = has_display;
-    let mut clocks = RccClockModel::new(core_clock_hz, is_f407);
+    let mut clocks = RccClockModel::new(core_clock_hz, hsi_hz, has_pllcfgr);
     eprintln!("[EMU] Realtime+UnlockedRender: core={}Hz, systick_div={}", core_clock_hz, systick_reload_divider);
     eprintln!("[EMU] CPU realtime step pacing enabled");
 
@@ -397,7 +399,7 @@ fn run_machine<C: CpuCore>(
                 }
                 Ok(ControlMsg::InjectGpio { port, pin, high }) => {
                     if let Some(ch) = port.chars().next() {
-                        let addr = gpio_idr_addr(ch, is_f407);
+                        let addr = gpio_idr_addr(ch, target_peripherals);
                         let b0 = machine.read8(addr).unwrap_or(0);
                         let b1 = machine.read8(addr + 1).unwrap_or(0);
                         let b2 = machine.read8(addr + 2).unwrap_or(0);

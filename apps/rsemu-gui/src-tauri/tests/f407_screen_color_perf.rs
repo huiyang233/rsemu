@@ -175,7 +175,7 @@ impl RealtimePacer {
 
 #[derive(Debug, Clone)]
 struct RccClockModel {
-    is_f407: bool,
+    has_pllcfgr: bool,
     cr: u32,
     cfgr: u32,
     pllcfgr: u32,
@@ -186,14 +186,14 @@ struct RccClockModel {
 }
 
 impl RccClockModel {
-    fn new(initial_core_hz: u32, is_f407: bool) -> Self {
+    fn new(initial_core_hz: u32, hsi_hz: u32, has_pllcfgr: bool) -> Self {
         Self {
-            is_f407,
+            has_pllcfgr,
             cr: 0x0000_0083,
             cfgr: 0x0000_0000,
             pllcfgr: 0x2400_3010,
             systick_load: 0,
-            hsi_hz: if is_f407 { 16_000_000 } else { 8_000_000 },
+            hsi_hz,
             hse_hz: 8_000_000,
             core_clock_hz: initial_core_hz.max(1),
         }
@@ -210,7 +210,7 @@ impl RccClockModel {
         match reg.as_str() {
             "CR" => self.cr = merge_mmio_write(self.cr, event),
             "CFGR" => self.cfgr = merge_mmio_write(self.cfgr, event),
-            "PLLCFGR" if self.is_f407 => {
+            "PLLCFGR" if self.has_pllcfgr => {
                 self.pllcfgr = merge_mmio_write(self.pllcfgr, event)
             }
             _ => return None,
@@ -248,7 +248,7 @@ impl RccClockModel {
     }
 
     fn compute_core_clock_hz(&self) -> u32 {
-        if self.is_f407 {
+        if self.has_pllcfgr {
             return self.compute_core_clock_hz_f407();
         }
         self.compute_core_clock_hz_f1()
@@ -405,7 +405,7 @@ fn run_profile(firmware_path: &Path, profile: Profile, wall_time: Duration) -> R
     let emu_cycles_per_step = base_emu_cycles_per_step as u32;
     let mut pacer = RealtimePacer::new(core_clock_hz, emu_cycles_per_step);
     pacer.set_enabled(true);
-    let mut rcc_model = RccClockModel::new(core_clock_hz, true);
+    let mut rcc_model = RccClockModel::new(core_clock_hz, 16_000_000, true);
 
     let mut steps = 0u64;
     let mut mmio_cursor = 0usize;
@@ -611,7 +611,7 @@ fn f407_screen_color_realtime_unlocked_render_emits_frames() {
     let dc_port = 'A';
     let dc_pin: u8 = 3;
 
-    let mut clocks = RccClockModel::new(core_clock_hz, true);
+    let mut clocks = RccClockModel::new(core_clock_hz, 16_000_000, true);
     let mut systick = WallClockSystickDriver::new();
     let mut mmio_cursor = 0usize;
     let mut steps = 0u64;
@@ -719,7 +719,7 @@ fn f407_rtthread_led_delay_stays_effective_in_realtime() {
     machine.set_step_driven_timers(false);
     machine.set_systick_reload_scaling(false);
     let mut systick = WallClockSystickDriver::new();
-    let mut clocks = RccClockModel::new(core_clock_hz, true);
+    let mut clocks = RccClockModel::new(core_clock_hz, 16_000_000, true);
 
     let mut mmio_cursor = 0usize;
     let mut line_buf: Vec<u8> = Vec::new();
