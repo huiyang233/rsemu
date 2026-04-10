@@ -18,13 +18,10 @@ export default function DisplayWidget({ config }: Props) {
       const canvas = canvasRef.current;
       if (!canvas) return;
 
-      // Decode base64 → Uint8Array
       const binary = atob(data);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
-      // The backend sends ARGB (LE u32 per pixel). Canvas expects RGBA.
-      // LE u32 ARGB = bytes [B, G, R, A] in memory.
       const rgba = new Uint8ClampedArray(width * height * 4);
       for (let i = 0; i < width * height; i++) {
         const b = bytes[i * 4 + 0];
@@ -34,7 +31,7 @@ export default function DisplayWidget({ config }: Props) {
         rgba[i * 4 + 0] = r;
         rgba[i * 4 + 1] = g;
         rgba[i * 4 + 2] = b;
-        rgba[i * 4 + 3] = a === 0 ? 255 : a; // treat fully transparent as opaque
+        rgba[i * 4 + 3] = a === 0 ? 255 : a;
       }
 
       canvas.width = width;
@@ -55,9 +52,9 @@ export default function DisplayWidget({ config }: Props) {
   }, [drawFrame]);
 
   return (
-    <div className="flex flex-col gap-2">
+    <>
       <div
-        className="relative rounded overflow-hidden border border-[#3a3a5e] bg-black"
+        className="relative bg-black"
         style={{ width: config.width, height: config.height }}
       >
         <canvas
@@ -67,16 +64,15 @@ export default function DisplayWidget({ config }: Props) {
           className="block"
           style={{ imageRendering: "pixelated", width: "100%", height: "100%" }}
         />
-        {/* Overlay when no frame yet */}
         {!hasFrame && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <p className="text-[#45475a] text-xs">No frame yet</p>
           </div>
         )}
       </div>
-      <p className="text-xs text-[#6c7086] text-center">
-        ST7789 {config.width}×{config.height}
+      <p className="text-xs text-[#6c7086] text-center py-1">
+        {config.width}×{config.height}
       </p>
-    </div>
+    </>
   );
 }

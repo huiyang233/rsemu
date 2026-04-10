@@ -20,7 +20,7 @@ export default function ButtonWidget({ config }: Props) {
   }, [config]);
 
   return (
-    <div className="flex flex-col items-center gap-2 p-3 bg-[#2a2a3e] rounded-lg border border-[#3a3a5e] w-28">
+    <div className="flex flex-col items-center gap-2 p-3">
       <button
         onMouseDown={handlePress}
         onMouseUp={handleRelease}

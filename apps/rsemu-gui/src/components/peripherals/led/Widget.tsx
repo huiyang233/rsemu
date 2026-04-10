@@ -10,7 +10,7 @@ export default function LedWidget({ config }: Props) {
   const on = useAppStore((s) => s.ledStates[config.id ?? ""] ?? false);
 
   return (
-    <div className="flex flex-col items-center gap-2 p-3 bg-[#2a2a3e] rounded-lg border border-[#3a3a5e] w-28">
+    <div className="flex flex-col items-center gap-2 p-3">
       {/* LED indicator */}
       <div
         className={`

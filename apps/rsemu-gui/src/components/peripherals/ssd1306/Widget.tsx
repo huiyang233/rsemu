@@ -56,9 +56,9 @@ export default function Ssd1306Widget({ config }: Props) {
   }, [drawFrame]);
 
   return (
-    <div className="flex flex-col gap-2">
+    <>
       <div
-        className="relative rounded overflow-hidden border border-[#3a3a5e] bg-black p-1"
+        className="relative bg-black p-1"
         style={{ width: cfgW * 2, height: cfgH * 2 }}
       >
         <canvas
@@ -69,9 +69,9 @@ export default function Ssd1306Widget({ config }: Props) {
           style={{ imageRendering: "pixelated", width: "100%", height: "100%" }}
         />
       </div>
-      <p className="text-xs text-[#6c7086] text-center">
-        SSD1306(I2C) {cfgW}×{cfgH} @ 0x{config.address.toString(16)}
+      <p className="text-xs text-[#6c7086] text-center py-1">
+        {cfgW}×{cfgH} @ 0x{config.address.toString(16)}
       </p>
-    </div>
+    </>
   );
 }

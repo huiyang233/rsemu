@@ -108,5 +108,11 @@ export function parseProjectFile(raw: string): RsemuProjectFile {
   if (!parsed.firmware?.path || !parsed.firmware?.path_kind) {
     throw new Error("Invalid project: missing firmware path");
   }
+  // Backward compat: ensure simPosition field exists on old project items
+  for (const item of parsed.canvas.items) {
+    if (item.simPosition === undefined) {
+      item.simPosition = null;
+    }
+  }
   return parsed as RsemuProjectFile;
 }

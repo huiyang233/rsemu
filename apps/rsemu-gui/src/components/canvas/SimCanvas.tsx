@@ -70,6 +70,7 @@ export default function SimCanvas() {
           x: Math.max(8, (rect ? 80 : 80) + drop.x),
           y: Math.max(8, 80 + drop.y),
         },
+        simPosition: null,
         config: null,
       });
     },

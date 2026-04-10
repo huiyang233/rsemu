@@ -36,6 +36,7 @@ interface AppState {
   updateCanvasItem: (instanceId: string, updates: Partial<CanvasItem>, markDirty?: boolean) => void;
   updateCanvasItemConfig: (instanceId: string, config: PeripheralConfig, markDirty?: boolean) => void;
   moveCanvasItem: (instanceId: string, position: { x: number; y: number }, markDirty?: boolean) => void;
+  moveSimItem: (instanceId: string, simPosition: { x: number; y: number }) => void;
 
   // ── Simulation runtime ───────────────────────────────────────────────────
   running: boolean;
@@ -112,6 +113,12 @@ export const useAppStore = create<AppState>((set) => ({
         i.instanceId === instanceId ? { ...i, position } : i
       ),
       dirty: s.dirty || markDirty,
+    })),
+  moveSimItem: (instanceId, simPosition) =>
+    set((s) => ({
+      canvasItems: s.canvasItems.map((i) =>
+        i.instanceId === instanceId ? { ...i, simPosition } : i
+      ),
     })),
 
   // ── Simulation runtime ───────────────────────────────────────────────────
