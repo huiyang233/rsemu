@@ -20,7 +20,7 @@ export function useEmulatorEvents(
   const setSimError   = useAppStore((s) => s.setSimError);
   const setSteps      = useAppStore((s) => s.setSteps);
   const setLedState   = useAppStore((s) => s.setLedState);
-  const appendUartByte = useAppStore((s) => s.appendUartByte);
+  const appendUartBytes = useAppStore((s) => s.appendUartBytes);
 
   useEffect(() => {
     const unsubs = [
@@ -30,7 +30,7 @@ export function useEmulatorEvents(
         if (p.error) setSimError(p.error);
       }),
       ledChangedBus.subscribe((p) => setLedState(p.id, p.on)),
-      uartOutputBus.subscribe((p) => appendUartByte(p.peripheral, p.byte)),
+      uartOutputBus.subscribe((p) => appendUartBytes(p.peripheral, p.bytes)),
       simStepsBus.subscribe((steps) => setSteps(steps)),
       ...(onFrame ? [displayFrameBus.subscribe(onFrame)] : []),
     ];
