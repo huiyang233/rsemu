@@ -1,5 +1,6 @@
 use crate::bus::SystemBus;
 use crate::cpu::{ArchitectureId, ArchitectureMemoryConfig, CpuArchitecture, CpuCore};
+use crate::target::{MemoryRegion, MemoryRegionKind};
 use std::collections::HashSet;
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, Mode, Prot, RegisterARM};
 use unicorn_engine::Unicorn;
@@ -61,6 +62,7 @@ pub struct CortexM4 {
     primask: u32,
     basepri: u32,
     faultmask: u32,
+    ram_regions: Vec<(u32, u32)>,
     uc: Unicorn<'static, UcData>,
 }
 
@@ -86,6 +88,7 @@ impl CortexM4 {
             primask: 0,
             basepri: 0,
             faultmask: 0,
+            ram_regions: Vec::new(),
             uc,
         })
     }
@@ -102,8 +105,8 @@ impl CortexM4 {
         value & 0xFFFF_FFE0 == 0xFFFF_FFE0
     }
 
-    fn is_valid_stack_addr(addr: u32) -> bool {
-        (0x2000_0000..0x2004_0000).contains(&addr) || (0x1000_0000..0x1001_0000).contains(&addr)
+    fn is_valid_stack_addr(&self, addr: u32) -> bool {
+        self.ram_regions.iter().any(|&(start, end)| (start..end).contains(&addr))
     }
 
     fn exception_return(&mut self, bus: &mut dyn SystemBus) -> Result<bool, String> {
@@ -119,9 +122,9 @@ impl CortexM4 {
             return Ok(false);
         }
         let mut sp = if use_psp { self.psp } else { self.msp };
-        if !Self::is_valid_stack_addr(sp) || !Self::is_valid_stack_addr(sp.wrapping_add(28)) {
+        if !self.is_valid_stack_addr(sp) || !self.is_valid_stack_addr(sp.wrapping_add(28)) {
             let candidate = self.registers[13];
-            if Self::is_valid_stack_addr(candidate) && Self::is_valid_stack_addr(candidate.wrapping_add(28)) {
+            if self.is_valid_stack_addr(candidate) && self.is_valid_stack_addr(candidate.wrapping_add(28)) {
                 sp = candidate;
                 if use_psp {
                     self.psp = candidate;
@@ -270,13 +273,13 @@ impl CortexM4 {
         self.registers[15] = self.uc.reg_read(RegisterARM::PC).map_err(|e| format!("uc reg_read pc failed: {e:?}"))? as u32;
         if let Ok(v) = self.uc.reg_read(RegisterARM::MSP) {
             let msp = v as u32;
-            if Self::is_valid_stack_addr(msp) {
+            if self.is_valid_stack_addr(msp) {
                 self.msp = msp;
             }
         }
         if let Ok(v) = self.uc.reg_read(RegisterARM::PSP) {
             let psp = v as u32;
-            if Self::is_valid_stack_addr(psp) {
+            if self.is_valid_stack_addr(psp) {
                 self.psp = psp;
             }
         }
@@ -365,7 +368,7 @@ impl CpuCore for CortexM4 {
         }
         if let Err(err) = result {
             if format!("{err:?}").contains("EXCEPTION") && begin <= 1 {
-                let recovery_sp = if Self::is_valid_stack_addr(self.psp) {
+                let recovery_sp = if self.is_valid_stack_addr(self.psp) {
                     self.psp
                 } else {
                     0x2000_1000
@@ -399,7 +402,7 @@ impl CpuCore for CortexM4 {
         Ok(ran.max(1))
     }
 
-    fn reset(&mut self, bus: &mut dyn SystemBus, vector_table_base: u64) -> Result<(), String> {
+    fn reset(&mut self, bus: &mut dyn SystemBus, vector_table_base: u64, memory_regions: &[MemoryRegion]) -> Result<(), String> {
         let initial_sp = bus.read32(vector_table_base)?;
         let reset_handler = bus.read32(vector_table_base + 4)?;
         self.registers = [0; 16];
@@ -414,21 +417,38 @@ impl CpuCore for CortexM4 {
         self.basepri = 0;
         self.faultmask = 0;
 
+        // Extract RAM regions for stack validation
+        self.ram_regions = memory_regions.iter()
+            .filter(|r| matches!(r.kind, MemoryRegionKind::Ram))
+            .map(|r| (r.range.start as u32, r.range.end as u32))
+            .collect();
+
+        // Fallback to common SRAM range if no RAM regions configured
+        if self.ram_regions.is_empty() {
+            self.ram_regions.push((0x2000_0000, 0x2004_0000));
+        }
+
         self.uc.get_data_mut().mapped_pages.clear();
         self.uc.get_data_mut().last_error = None;
         self.uc.get_data_mut().exc_return_fail_logged = false;
         self.uc.get_data_mut().pending_exc_return = None;
 
-        // Dynamically map FLASH and RAM from target
-        let mut regions = Vec::new();
-        // Since we don't have direct access to TargetSpec here, we'll try to map common ranges 
-        // that are memory-backed in the bus.
-        // Actually, the bus implementation knows what's memory backed. 
-        // For now, let's use a heuristic or add a method to SystemBus.
-        // Given the constraints, let's map 0x0800_0000 (Flash) and 0x2000_0000 (SRAM) and 0x1000_0000 (CCM)
-        regions.push((0x0800_0000, 0x0810_0000));
-        regions.push((0x2000_0000, 0x2004_0000)); // Map up to 256KB SRAM
-        regions.push((0x1000_0000, 0x1001_0000));
+        // Map flash and RAM regions from target memory layout
+        let mappable: Vec<(u64, u64)> = memory_regions.iter()
+            .filter(|r| matches!(r.kind, MemoryRegionKind::Flash | MemoryRegionKind::Ram))
+            .map(|r| (r.range.start, r.range.end))
+            .collect();
+
+        // Fallback if no regions configured
+        let regions: Vec<(u64, u64)> = if mappable.is_empty() {
+            vec![
+                (0x0800_0000, 0x0810_0000),
+                (0x2000_0000, 0x2004_0000),
+                (0x1000_0000, 0x1001_0000),
+            ]
+        } else {
+            mappable
+        };
 
         for &(start, end) in &regions {
             let size = end - start;
@@ -495,10 +515,10 @@ impl CpuCore for CortexM4 {
 
         let in_handler = self.current_exception != 0;
         let prefer_psp = !in_handler && (self.control & 0x2) != 0;
-        let use_psp = prefer_psp && Self::is_valid_stack_addr(self.psp);
+        let use_psp = prefer_psp && self.is_valid_stack_addr(self.psp);
         let active_sp = if use_psp { self.psp } else { self.msp };
         let next_sp = active_sp.wrapping_sub(32);
-        if !Self::is_valid_stack_addr(next_sp) || !Self::is_valid_stack_addr(next_sp.wrapping_add(28)) {
+        if !self.is_valid_stack_addr(next_sp) || !self.is_valid_stack_addr(next_sp.wrapping_add(28)) {
             return Ok(false);
         }
         bus.write32(next_sp as u64, self.registers[0])?;

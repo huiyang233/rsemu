@@ -7,7 +7,7 @@
 Runtime is driven by a board config file (`board.toml`) instead of many CLI flags.
 
 ```bash
-cargo run -p rsemu-cli --release -- --board board.toml --no-gui --max-steps 1000000
+cargo run -p rsemu-cli --release -- --board examples/board.toml --no-gui --max-steps 1000000
 ```
 
 CLI options:
@@ -20,9 +20,10 @@ CLI options:
 
 ## board.toml Example
 
+See `examples/board.toml` for a complete example.
+
 ```toml
 target = "STM32F407"
-svd = "examples/stm32f407.svd"
 firmware = "firmware/rtthread.bin"
 load_addr = 0x08000000
 cycle_scale = 1
@@ -93,3 +94,5 @@ Notes:
 - `crates/rsemu-targets`: target definitions (`f103`, `f407`)
 - `crates/rsemu-peripherals`: pluggable peripheral implementations
 - `apps/rsemu-cli`: board loading + run loop
+- `apps/rsemu-gui`: Tauri 2.0 GUI app (Rust backend + React/TS frontend)
+- `examples/`: example board configs and sample files

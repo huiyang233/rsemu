@@ -315,12 +315,29 @@ fn run_machine<C: CpuCore>(
                 let i2c_bus = I2cBus::new(Box::new(device));
                 bus_ctx.register_i2c(i2c_peripheral, i2c_bus);
             }
+            PeripheralConfig::Custom { type_name, params } => {
+                eprintln!("[EMU]   [{}] Custom peripheral '{}' ({} params) — skipped, no handler",
+                    idx, type_name, params.len());
+            }
         }
     }
 
     let has_display = bus_ctx.has_bus_devices();
     eprintln!("[EMU] Peripherals initialized: has_display={}, {} UARTs",
         has_display, uart_peripherals.len());
+
+    // Wire up IRQ callback: bus devices push to shared queue, main loop flushes
+    {
+        let irq_queue = std::sync::Arc::clone(machine.pending_irqs());
+        bus_ctx.set_irq_callbacks(&move || {
+            let q = irq_queue.clone();
+            Box::new(move |irq: u8| {
+                if let Ok(mut guard) = q.lock() {
+                    guard.push(irq);
+                }
+            })
+        });
+    }
 
     // Realtime + UnlockedRender:
     // - CPU loop runs as fast as possible
@@ -434,6 +451,7 @@ fn run_machine<C: CpuCore>(
                     systick_reload_divider,
                 );
                 wallclock_timers.tick(&mut machine, clocks.core_clock_hz);
+                machine.flush_pending_irqs();
 
                 if Instant::now() >= next_stream_deadline {
                     let event_begin = Instant::now();

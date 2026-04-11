@@ -6,6 +6,9 @@ use crate::bus::spi_bus::SpiBus;
 use crate::bus::traits::{FrameUpdate, GpioListener};
 use crate::execution::gpio_port_letter;
 use crate::MmioWriteEvent;
+use crate::{
+    META_GPIO_ANY, META_I2C_CR1, META_I2C_DR, META_SPI_DATA,
+};
 
 /// Statistics returned by dispatch_mmio().
 #[derive(Debug, Clone, Copy, Default)]
@@ -88,15 +91,29 @@ impl BusContext {
         self.fsmc_buses.push(FsmcBinding { base_addr, size, bus });
     }
 
+    /// Set a global IRQ callback factory on all registered SPI, I2C, and FSMC buses.
+    /// The factory is called once per bus to produce independent callbacks.
+    /// Call this after all buses are registered.
+    pub fn set_irq_callbacks(&mut self, make_cb: &dyn Fn() -> crate::bus::irq::IrqCallback) {
+        for binding in &mut self.spi_buses {
+            binding.bus.set_irq(0, make_cb());
+        }
+        for binding in &mut self.i2c_buses {
+            binding.bus.set_irq(0, make_cb());
+        }
+        for binding in &mut self.fsmc_buses {
+            binding.bus.set_irq(0, make_cb());
+        }
+    }
+
     /// Route a single MMIO write event to the appropriate bus devices.
     pub fn dispatch_mmio(&mut self, event: &MmioWriteEvent) -> BusContextStats {
         let mut stats = BusContextStats::default();
-        // Names are pre-uppercased in RegisterMeta at init time, no runtime conversion needed.
         let periph = &*event.peripheral;
-        let reg = &*event.register;
+        let flags = event.flags;
 
-        // ── SPI DR writes ────────────────────────────────────────────
-        if periph.starts_with("SPI") && reg == "DR" {
+        // ── SPI DR writes (flag-based) ───────────────────────────────
+        if flags & META_SPI_DATA != 0 {
             let byte = (event.value & 0xFF) as u8;
             for binding in &mut self.spi_buses {
                 if binding.peripheral == periph {
@@ -107,8 +124,8 @@ impl BusContext {
             }
         }
 
-        // ── I2C CR1 writes ───────────────────────────────────────────
-        if periph.starts_with("I2C") && reg == "CR1" {
+        // ── I2C CR1 writes (flag-based) ──────────────────────────────
+        if flags & META_I2C_CR1 != 0 {
             for binding in &mut self.i2c_buses {
                 if binding.peripheral == periph {
                     binding.bus.on_cr1_write(event.value);
@@ -117,8 +134,8 @@ impl BusContext {
             }
         }
 
-        // ── I2C DR writes ────────────────────────────────────────────
-        if periph.starts_with("I2C") && reg == "DR" {
+        // ── I2C DR writes (flag-based) ───────────────────────────────
+        if flags & META_I2C_DR != 0 {
             let byte = (event.value & 0xFF) as u8;
             for binding in &mut self.i2c_buses {
                 if binding.peripheral == periph {
@@ -129,8 +146,8 @@ impl BusContext {
             }
         }
 
-        // ── GPIO writes ──────────────────────────────────────────────
-        let is_gpio = periph.starts_with("GPIO")
+        // ── GPIO writes (flag-based, with single-char fallback) ──────
+        let is_gpio = flags & META_GPIO_ANY != 0
             || (event.peripheral.len() == 1
                 && event.peripheral
                     .chars()
@@ -164,13 +181,13 @@ impl BusContext {
 
     /// Internal: dispatch GPIO ODR/BSRR events.
     fn dispatch_gpio(&mut self, port: char, event: &MmioWriteEvent) {
-        let reg = &*event.register;
+        use crate::{META_GPIO_BSRR, META_GPIO_ODR};
 
-        if reg == "ODR" {
+        if event.flags & META_GPIO_ODR != 0 {
             let val16 = (event.value & 0xFFFF) as u16;
             self.gpio_notifier.notify_mask_diff(port, 0, val16);
             self.bridge_gpio_to_spi_odr(port, val16);
-        } else if reg == "BSRR" {
+        } else if event.flags & META_GPIO_BSRR != 0 {
             let set_mask = (event.value & 0xFFFF) as u16;
             let rst_mask = ((event.value >> 16) & 0xFFFF) as u16;
             for pin in 0..16u8 {

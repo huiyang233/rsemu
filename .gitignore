@@ -24,6 +24,13 @@ target/
 # Logs
 *.log
 
+# Project docs (local only)
+docs/
+
+# Claude Code
+CLAUDE.md
+.claude/
+
 # Node.js
 node_modules/
 npm-debug.log*

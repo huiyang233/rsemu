@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub mod display;
 pub mod led;
@@ -56,6 +57,18 @@ pub enum PeripheralConfig {
     Button {
         id: String,
         pin: PinMapping,
+    },
+    /// Escape hatch: allows board.toml to declare peripheral types not
+    /// yet known as first-class variants. The `params` map is passed
+    /// through verbatim — the app layer can use it to instantiate custom
+    /// peripheral implementations without recompiling this crate.
+    #[serde(rename = "custom")]
+    Custom {
+        /// User-defined type name (e.g. "my_sensor").
+        type_name: String,
+        /// Arbitrary key-value parameters from TOML/JSON.
+        #[serde(default)]
+        params: HashMap<String, String>,
     },
 }
 

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::trace;
 
 use crate::bus::SystemBus;
@@ -20,6 +20,8 @@ pub struct MmioWriteEvent {
     pub addr: u64,
     pub width: u8,
     pub value: u32,
+    /// Classification flags from RegisterMeta, forwarded for fast dispatch.
+    pub flags: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -32,16 +34,20 @@ struct RegisterMeta {
     paired_addr: u64,
 }
 
-const META_USART_STATUS: u16 = 1 << 0;
-const META_USART_DATA: u16 = 1 << 1;
-const META_SPI_STATUS: u16 = 1 << 2;
-const META_SPI_DATA: u16 = 1 << 3;
-const META_RCC_CONTROL: u16 = 1 << 4;
-const META_TIMER_STATUS: u16 = 1 << 5;
-const META_GPIO_BSRR: u16 = 1 << 6;
-const META_RCC_CFGR: u16 = 1 << 7;
-const META_RCC_CSR: u16 = 1 << 8;
-const META_PWR_CSR: u16 = 1 << 9;
+pub const META_USART_STATUS: u16 = 1 << 0;
+pub const META_USART_DATA: u16 = 1 << 1;
+pub const META_SPI_STATUS: u16 = 1 << 2;
+pub const META_SPI_DATA: u16 = 1 << 3;
+pub const META_RCC_CONTROL: u16 = 1 << 4;
+pub const META_TIMER_STATUS: u16 = 1 << 5;
+pub const META_GPIO_BSRR: u16 = 1 << 6;
+pub const META_RCC_CFGR: u16 = 1 << 7;
+pub const META_RCC_CSR: u16 = 1 << 8;
+pub const META_PWR_CSR: u16 = 1 << 9;
+pub const META_I2C_CR1: u16 = 1 << 10;
+pub const META_I2C_DR: u16 = 1 << 11;
+pub const META_GPIO_ODR: u16 = 1 << 12;
+pub const META_GPIO_ANY: u16 = META_GPIO_ODR | META_GPIO_BSRR;
 
 #[derive(Debug, Clone)]
 struct SystickState {
@@ -252,6 +258,7 @@ pub struct Machine<C: CpuCore> {
     nvic_any_enabled: bool,
     timers: Vec<TimerModel>,
     rcc_regs: Option<RccRegs>,
+    pending_irqs: Arc<Mutex<Vec<u8>>>,
 }
 
 impl<C: CpuCore> Machine<C> {
@@ -383,6 +390,7 @@ impl<C: CpuCore> Machine<C> {
             nvic_any_enabled,
             timers,
             rcc_regs,
+            pending_irqs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -434,7 +442,7 @@ impl<C: CpuCore> Machine<C> {
             systick: &mut self.systick,
             nvic_any_enabled: &mut self.nvic_any_enabled,
         };
-        self.cpu.reset(&mut bus, vector_table_base)
+        self.cpu.reset(&mut bus, vector_table_base, &self.target.memory_map)
     }
 
     pub fn read_mmio(&self, addr: u64) -> u8 {
@@ -539,18 +547,32 @@ impl<C: CpuCore> Machine<C> {
 
     /// Create an IrqCallback that sets an IRQ pending on this machine.
     /// Usage: `let cb = machine.make_irq_callback(); spi_bus.set_irq(irq_num, cb);`
-    /// Note: the callback clones an `Arc<Mutex<>>` handle, so it can outlive the borrow.
-    pub fn make_irq_callback<C2: CpuCore>(_machine: &Machine<C2>) -> crate::IrqCallback {
-        // Since Machine is not thread-safe and the callback needs mutable access,
-        // we use a simpler approach: the bus fires the callback, which stores the
-        // IRQ number in a side channel. The main loop then flushes pending IRQs
-        // into the machine before the next step.
-        //
-        // For now, we provide a simple immediate callback that does nothing here —
-        // the actual wiring happens at the app layer where Machine is accessible.
-        Box::new(|_irq: u8| {
-            // Default no-op; app layer should replace with actual machine access
+    /// The callback pushes IRQ numbers to a shared queue; call `flush_pending_irqs()`
+    /// after each step batch to apply them to NVIC.
+    pub fn make_irq_callback(&self) -> crate::IrqCallback {
+        let queue = Arc::clone(&self.pending_irqs);
+        Box::new(move |irq: u8| {
+            if let Ok(mut q) = queue.lock() {
+                q.push(irq);
+            }
         })
+    }
+
+    /// Flush any IRQs queued by IrqCallback into the NVIC pending registers.
+    /// Call this after each step batch in the main loop.
+    pub fn flush_pending_irqs(&mut self) {
+        let irqs: Vec<u8> = {
+            let mut q = self.pending_irqs.lock().unwrap();
+            std::mem::take(&mut *q)
+        };
+        for irq in irqs {
+            nvic_pending_write(&mut self.mmio, irq, true);
+        }
+    }
+
+    /// Access the shared pending-IRQ queue (for wiring up callbacks).
+    pub fn pending_irqs(&self) -> &Arc<Mutex<Vec<u8>>> {
+        &self.pending_irqs
     }
 
     pub fn read8(&mut self, addr: u64) -> Result<u8, String> {
@@ -1668,6 +1690,15 @@ fn classify_meta_flags(peripheral: &str, register: &str) -> u16 {
     if peripheral.starts_with("GPIO") && register.eq_ignore_ascii_case("BSRR") {
         flags |= META_GPIO_BSRR;
     }
+    if peripheral.starts_with("GPIO") && register.eq_ignore_ascii_case("ODR") {
+        flags |= META_GPIO_ODR;
+    }
+    if peripheral.starts_with("I2C") && register.eq_ignore_ascii_case("CR1") {
+        flags |= META_I2C_CR1;
+    }
+    if peripheral.starts_with("I2C") && register.eq_ignore_ascii_case("DR") {
+        flags |= META_I2C_DR;
+    }
     flags
 }
 
@@ -1766,6 +1797,7 @@ fn decode_mmio_write(
             addr,
             width,
             value,
+            flags: meta.flags,
         });
     }
     None

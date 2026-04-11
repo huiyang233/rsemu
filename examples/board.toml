@@ -1,5 +1,4 @@
 target = "STM32F407"
-svd = "examples/stm32f407.svd"
 firmware = "firmware/rtthread.bin"
 load_addr = 0x08000000
 cycle_scale = 1

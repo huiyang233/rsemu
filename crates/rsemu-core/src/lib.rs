@@ -20,7 +20,11 @@ pub use clock::RccClockModel;
 pub use cpu::{ArchitectureId, CpuArchitecture, CpuCore};
 pub use execution::{gpio_idr_addr, gpio_port_letter, StepBatchController};
 pub use image::{FirmwareFormat, FirmwareLoader};
-pub use machine::{Machine, MachineBusInterface, MmioWriteEvent, SerialEvent};
+pub use machine::{
+    Machine, MachineBusInterface, MmioWriteEvent, SerialEvent,
+    META_GPIO_ANY, META_GPIO_BSRR, META_GPIO_ODR, META_I2C_CR1, META_I2C_DR,
+    META_SPI_DATA, META_SPI_STATUS, META_USART_DATA,
+};
 pub use memory::{FirmwareImage, MemoryBlock};
 pub use target::{
     CpuType, MemoryRegion, MemoryRegionKind, PeripheralSpec, RegisterSpec, RegisterValueSet,

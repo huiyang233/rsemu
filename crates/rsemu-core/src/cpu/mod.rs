@@ -30,6 +30,7 @@ pub trait CpuCore {
         &mut self,
         bus: &mut dyn crate::bus::SystemBus,
         vector_table_base: u64,
+        memory_regions: &[crate::target::MemoryRegion],
     ) -> Result<(), String>;
     fn architecture(&self) -> &dyn CpuArchitecture;
     fn program_counter(&self) -> u64;

@@ -1,8 +1,10 @@
 use crate::MmioWriteEvent;
 
-/// RCC clock model — tracks STM32F1/F4 clock tree from MMIO events.
+/// RCC clock model — tracks STM32 clock tree from MMIO events.
 ///
-/// Extracted from CLI/GUI duplicated implementations.
+/// Supports two PLL architectures selected by `has_pllcfgr`:
+/// - **CFGR-based** (has_pllcfgr=false): PLL config in CFGR register (STM32F1 etc.)
+/// - **PLLCFGR-based** (has_pllcfgr=true): dedicated PLLCFGR with VCO params (STM32F4 etc.)
 #[derive(Debug, Clone)]
 pub struct RccClockModel {
     has_pllcfgr: bool,
@@ -85,22 +87,24 @@ impl RccClockModel {
 
     fn compute_core_clock_hz(&self) -> u32 {
         if self.has_pllcfgr {
-            return self.compute_core_clock_hz_f407();
+            return self.compute_core_clock_hz_pllcfgr();
         }
-        self.compute_core_clock_hz_f1()
+        self.compute_core_clock_hz_cfgr()
     }
 
-    fn compute_core_clock_hz_f1(&self) -> u32 {
+    /// CFGR-based PLL: PLL multiplier and source configured in CFGR register.
+    fn compute_core_clock_hz_cfgr(&self) -> u32 {
         let sysclk = match self.cfgr & 0x3 {
             0b00 => self.hsi_hz,
             0b01 => self.hse_hz,
-            0b10 => self.pll_output_hz_f1(),
+            0b10 => self.pll_output_hz_cfgr(),
             _ => self.hsi_hz,
         };
         sysclk / self.ahb_prescaler().max(1)
     }
 
-    fn compute_core_clock_hz_f407(&self) -> u32 {
+    /// PLLCFGR-based PLL: dedicated register with VCO, M/N/P dividers.
+    fn compute_core_clock_hz_pllcfgr(&self) -> u32 {
         let hsi_ready = (self.cr >> 1) & 1 == 1;
         let hse_ready = (self.cr >> 17) & 1 == 1;
         let pll_ready = (self.cr >> 25) & 1 == 1;
@@ -113,7 +117,7 @@ impl RccClockModel {
             }
             0b10 => {
                 if pll_ready {
-                    self.pll_output_hz_f407()
+                    self.pll_output_hz_pllcfgr()
                 } else if hsi_ready {
                     self.hsi_hz
                 } else {
@@ -125,17 +129,17 @@ impl RccClockModel {
         sysclk / self.ahb_prescaler().max(1)
     }
 
-    fn pll_output_hz_f1(&self) -> u32 {
+    fn pll_output_hz_cfgr(&self) -> u32 {
         let src_hz = if (self.cfgr >> 16) & 0x1 == 0 {
             self.hsi_hz / 2
         } else {
             let hse_div = if (self.cfgr >> 17) & 0x1 == 0 { 1 } else { 2 };
             self.hse_hz / hse_div
         };
-        src_hz.saturating_mul(self.pll_mul_factor_f1())
+        src_hz.saturating_mul(self.pll_mul_factor_cfgr())
     }
 
-    fn pll_output_hz_f407(&self) -> u32 {
+    fn pll_output_hz_pllcfgr(&self) -> u32 {
         let src_hz = if ((self.pllcfgr >> 22) & 0x1) == 1 {
             self.hse_hz as u64
         } else {
@@ -154,7 +158,7 @@ impl RccClockModel {
         (vco_out / p).clamp(1, u64::from(u32::MAX)) as u32
     }
 
-    fn pll_mul_factor_f1(&self) -> u32 {
+    fn pll_mul_factor_cfgr(&self) -> u32 {
         match (self.cfgr >> 18) & 0xF {
             0..=13 => ((self.cfgr >> 18) & 0xF) + 2,
             14 | 15 => 16,
