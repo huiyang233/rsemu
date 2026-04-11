@@ -1,31 +1,23 @@
 target = "STM32F407"
-firmware = "firmware/rtthread.bin"
+firmware = "../firmware/rtthread.bin"
 load_addr = 0x08000000
 cycle_scale = 1
 
 [[peripherals]]
-type = "uart_terminal"
-id = "console0"
-enabled = true
+type = "uart"
 usart = "USART1"
 tx = { port = "A", pin = 9 }
 rx = { port = "A", pin = 10 }
 
 [[peripherals]]
-type = "st7789"
-id = "lcd0"
-enabled = true
+type = "st7789_spi"
 width = 240
 height = 320
 spi_base = 0x40013000
 cs = { port = "A", pin = 4 }
 dc = { port = "A", pin = 3 }
-dump_frames = false
-output_dir = "/tmp/rsemu-st7789"
 
 [[peripherals]]
 type = "led"
-id = "red"
-enabled = true
 pin = { port = "F", pin = 12 }
 active_low = true

@@ -24,12 +24,13 @@ pub fn run() -> Result<(), String> {
     let args = CliArgs::parse()?;
     let board = load_board_config(&args.board_path)?;
 
-    // Resolve configs/ and svds/ dirs relative to the board.toml or project root
+    // Resolve configs/ and svds/ dirs: search from board.toml parent, then walk up to project root
     let board_dir = Path::new(&args.board_path)
         .parent()
         .unwrap_or(Path::new("."));
-    let configs_dir = board_dir.join("configs");
-    let svds_dir = board_dir.join("svds");
+    let project_root = find_project_root(board_dir);
+    let configs_dir = project_root.join("configs");
+    let svds_dir = project_root.join("svds");
     let registry = TargetRegistry::from_dirs(&configs_dir, &svds_dir)?;
 
     let target_id = board
@@ -77,6 +78,26 @@ struct UartTerminalBinding {
 fn load_board_config(path: &str) -> Result<BoardConfig, String> {
     let raw = fs::read_to_string(path).map_err(|e| format!("read board config failed ({path}): {e}"))?;
     toml::from_str(&raw).map_err(|e| format!("parse board config failed ({path}): {e}"))
+}
+
+/// Walk up from `start` to find a directory containing `configs/`.
+fn find_project_root(start: &Path) -> PathBuf {
+    let mut dir = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(start)
+    };
+    dir = dir.canonicalize().unwrap_or(dir);
+    loop {
+        if dir.join("configs").is_dir() {
+            return dir;
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    // Fallback: use start dir
+    start.to_path_buf()
 }
 
 fn resolve_path(board_path: &str, maybe_rel: Option<&str>) -> Option<String> {
