@@ -1,98 +1,199 @@
 # rsemu
 
-`rsemu` is an MCU emulator prototype focused on STM32 targets with pluggable peripherals.
+[English](#english) | [中文](#中文)
 
-## Run Model
+---
 
-Runtime is driven by a board config file (`board.toml`) instead of many CLI flags.
+## English
+
+`rsemu` is an STM32 MCU emulator with pluggable peripherals, powered by [unicorn-engine](https://github.com/unicorn-engine/unicorn) for CPU emulation. It provides both a CLI runner and a Tauri-based GUI.
+
+### Supported Targets
+
+Target configs are JSON-driven — add a new chip by dropping a JSON + SVD file, no Rust code changes needed.
+
+| Target | Core | HSI | Config |
+|--------|------|-----|--------|
+| STM32F103 | Cortex-M3 | 8 MHz | `configs/stm32f103.json` |
+| STM32F401 | Cortex-M4 | 16 MHz | `configs/stm32f401.json` |
+| STM32F407 | Cortex-M4 | 16 MHz | `configs/stm32f407.json` |
+| STM32F411 | Cortex-M4 | 16 MHz | `configs/stm32f411.json` |
+| STM32F427 | Cortex-M4 | 16 MHz | `configs/stm32f427.json` |
+| STM32F429 | Cortex-M4 | 16 MHz | `configs/stm32f429.json` |
+
+### Supported Peripherals
+
+| Type | Bus | Description |
+|------|-----|-------------|
+| ST7789 (SPI) | SPI + GPIO | LCD display, 240x320 etc. |
+| ST7789 (FSMC) | FSMC | LCD display via parallel bus |
+| SSD1306 (I2C) | I2C | OLED monochrome display |
+| LED | GPIO | Pin state monitor with callback |
+| UART | USART | Serial console (xterm.js in GUI) |
+| Button | GPIO | GPIO input injection |
+| Custom | — | Escape hatch via `HashMap<String, String>` params |
+
+### CLI
 
 ```bash
 cargo run -p rsemu-cli --release -- --board examples/board.toml --no-gui --max-steps 1000000
 ```
 
-CLI options:
+Options:
+- `--board <path>` — board config path (default `board.toml`)
+- `--max-steps <n>` — instruction step limit
+- `--no-gui` — disable display window
+- `--fast` — run without realtime pacing
+- `--dump-frames` — dump ST7789 frames to disk
 
-- `--board <path>` board config path (default `board.toml`)
-- `--max-steps <n>` instruction-step limit
-- `--no-gui` disable display window
-- `--fast` run without realtime pacing
-- `--dump-frames` dump ST7789 frames (if enabled)
+### GUI
 
-## board.toml Example
+```bash
+cd apps/rsemu-gui
+npm install
+npm run tauri dev                # dev mode
+npm run tauri dev -- --release   # backend release for perf
+npm run tauri build              # production bundle
+```
 
-See `examples/board.toml` for a complete example.
+Environment variables:
+- `RSEMU_GUI_STEP_TRACE=1` — verbose step trace for diagnosis
+
+### Board Config
+
+See [`examples/board.toml`](examples/board.toml) for a complete example.
 
 ```toml
 target = "STM32F407"
 firmware = "firmware/rtthread.bin"
 load_addr = 0x08000000
-cycle_scale = 1
 
 [[peripherals]]
-type = "uart_terminal"
-id = "console0"
-enabled = true
-usart = "USART1"
-tx = { port = "A", pin = 9 }
-rx = { port = "A", pin = 10 }
-
-[[peripherals]]
-type = "st7789"
-id = "lcd0"
-enabled = true
+type = "st7789_spi"
 width = 240
 height = 320
 spi_base = 0x40013000
 cs = { port = "A", pin = 4 }
 dc = { port = "A", pin = 3 }
-dump_frames = false
-output_dir = "/tmp/rsemu-st7789"
 
 [[peripherals]]
 type = "led"
-id = "red"
-enabled = true
 pin = { port = "F", pin = 12 }
 active_low = true
 ```
 
-## Peripheral Notes
+### Workspace Layout
 
-- `uart_terminal`: entering this config enables an interactive serial console in the current terminal.
-- `st7789`: receives SPI/GPIO traffic and can show frames in a GUI window.
-- `led`: watches a configured GPIO pin and prints state changes (`on` / `off`).
+```
+crates/rsemu-core          — CPU, memory bus, machine runtime, bus-device traits
+crates/rsemu-svd           — CMSIS SVD register description parser
+crates/rsemu-targets       — Target registry (JSON config + SVD loading)
+crates/rsemu-peripherals   — Pluggable peripheral implementations
+apps/rsemu-cli             — Board loading + CLI run loop
+apps/rsemu-gui             — Tauri 2.0 GUI (Rust backend + React/TS frontend)
+configs/                   — Target JSON configs (one file per chip)
+svds/                      — CMSIS SVD files
+examples/                  — Example board configs
+```
 
-## GUI (rsemu-gui)
+### License
 
-GUI app path: `apps/rsemu-gui`.
+MIT
 
-Quick start:
+---
+
+## 中文
+
+`rsemu` 是一个基于 [unicorn-engine](https://github.com/unicorn-engine/unicorn) 的 STM32 MCU 仿真器，支持可插拔外设，提供 CLI 和 Tauri GUI 两种运行方式。
+
+### 支持的目标芯片
+
+芯片配置采用 JSON 驱动 — 新增芯片只需添加 JSON + SVD 文件，无需修改 Rust 代码。
+
+| 目标芯片 | 内核 | HSI | 配置文件 |
+|----------|------|-----|----------|
+| STM32F103 | Cortex-M3 | 8 MHz | `configs/stm32f103.json` |
+| STM32F401 | Cortex-M4 | 16 MHz | `configs/stm32f401.json` |
+| STM32F407 | Cortex-M4 | 16 MHz | `configs/stm32f407.json` |
+| STM32F411 | Cortex-M4 | 16 MHz | `configs/stm32f411.json` |
+| STM32F427 | Cortex-M4 | 16 MHz | `configs/stm32f427.json` |
+| STM32F429 | Cortex-M4 | 16 MHz | `configs/stm32f429.json` |
+
+### 支持的外设
+
+| 类型 | 总线 | 说明 |
+|------|------|------|
+| ST7789 (SPI) | SPI + GPIO | LCD 显示屏，240x320 等 |
+| ST7789 (FSMC) | FSMC | 并口 LCD 显示屏 |
+| SSD1306 (I2C) | I2C | OLED 单色显示屏 |
+| LED | GPIO | 引脚状态监控，带回调通知 |
+| UART | USART | 串口终端（GUI 中使用 xterm.js） |
+| Button | GPIO | GPIO 输入注入 |
+| Custom | — | 通用扩展，使用 `HashMap<String, String>` 参数 |
+
+### CLI 运行
+
+```bash
+cargo run -p rsemu-cli --release -- --board examples/board.toml --no-gui --max-steps 1000000
+```
+
+参数说明：
+- `--board <path>` — 板级配置文件路径（默认 `board.toml`）
+- `--max-steps <n>` — 指令步数上限
+- `--no-gui` — 禁用显示窗口
+- `--fast` — 不做实时 pacing，全速运行
+- `--dump-frames` — 将 ST7789 帧数据写入磁盘
+
+### GUI 运行
 
 ```bash
 cd apps/rsemu-gui
 npm install
-npm run tauri dev
+npm run tauri dev                # 开发模式
+npm run tauri dev -- --release   # 后端 release 模式，性能更好
+npm run tauri build              # 构建生产包
 ```
 
-Useful run modes:
+环境变量：
+- `RSEMU_GUI_STEP_TRACE=1` — 开启详细单步追踪，用于问题诊断
 
-- Dev (fast iteration): `npm run tauri dev`
-- Backend release in dev session (higher throughput): `npm run tauri dev -- --release`
-- Build app bundle: `npm run tauri build`
+### 板级配置
 
-Notes:
+完整示例见 [`examples/board.toml`](examples/board.toml)。
 
-- GUI runtime uses realtime + unlocked render behavior for display workloads.
-- Backend prints perf stats as `[EMU][PERF] ...` every second.
-- Optional verbose step trace (for diagnosis): `RSEMU_GUI_STEP_TRACE=1 npm run tauri dev`
-- Detailed guide: `apps/rsemu-gui/doc/realtime-unlockedrender-guide.md`
+```toml
+target = "STM32F407"
+firmware = "firmware/rtthread.bin"
+load_addr = 0x08000000
 
-## Workspace Layout
+[[peripherals]]
+type = "st7789_spi"
+width = 240
+height = 320
+spi_base = 0x40013000
+cs = { port = "A", pin = 4 }
+dc = { port = "A", pin = 3 }
 
-- `crates/rsemu-core`: CPU, memory bus, machine runtime
-- `crates/rsemu-svd`: SVD parsing
-- `crates/rsemu-targets`: target definitions (`f103`, `f407`)
-- `crates/rsemu-peripherals`: pluggable peripheral implementations
-- `apps/rsemu-cli`: board loading + run loop
-- `apps/rsemu-gui`: Tauri 2.0 GUI app (Rust backend + React/TS frontend)
-- `examples/`: example board configs and sample files
+[[peripherals]]
+type = "led"
+pin = { port = "F", pin = 12 }
+active_low = true
+```
+
+### 工作区结构
+
+```
+crates/rsemu-core          — CPU、内存总线、机器运行时、总线-设备 trait
+crates/rsemu-svd           — CMSIS SVD 寄存器描述解析器
+crates/rsemu-targets       — 目标注册表（JSON 配置 + SVD 加载）
+crates/rsemu-peripherals   — 可插拔外设实现
+apps/rsemu-cli             — 板级加载 + CLI 运行循环
+apps/rsemu-gui             — Tauri 2.0 GUI（Rust 后端 + React/TS 前端）
+configs/                   — 目标芯片 JSON 配置（每芯片一个文件）
+svds/                      — CMSIS SVD 文件
+examples/                  — 板级配置示例
+```
+
+### 许可证
+
+MIT
