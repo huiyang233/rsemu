@@ -584,10 +584,9 @@ fn process_events<C: CpuCore>(
     }
     *serial_cursor = serial.len();
 
-    // Flush UART batch only when it reaches the batch size threshold.
-    // The previous `|| !uart_batch.is_empty()` condition was defeating batching
-    // by flushing on every tick regardless of size.
-    if uart_batch.len() >= uart_batch_size {
+    // Flush UART batch when it reaches batch size OR every process_events call
+    // to avoid stalling for low-throughput UART output.
+    if uart_batch.len() >= uart_batch_size || !uart_batch.is_empty() {
         flush_uart_batch(app, uart_batch);
     }
 
