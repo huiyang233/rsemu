@@ -86,7 +86,7 @@ export function createProjectFile(args: {
       items: args.canvasItems,
     },
     ui: {
-      last_page: "setup",
+      last_page: "workspace",
     },
   };
 }
@@ -107,12 +107,6 @@ export function parseProjectFile(raw: string): RsemuProjectFile {
   }
   if (!parsed.firmware?.path || !parsed.firmware?.path_kind) {
     throw new Error("Invalid project: missing firmware path");
-  }
-  // Backward compat: ensure simPosition field exists on old project items
-  for (const item of parsed.canvas.items) {
-    if (item.simPosition === undefined) {
-      item.simPosition = null;
-    }
   }
   return parsed as RsemuProjectFile;
 }

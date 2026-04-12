@@ -6,10 +6,11 @@ import type { UartConfig } from "../../../types/peripheral";
 
 interface Props {
   config: UartConfig;
+  interactive?: boolean;
   onClear?: () => void;
 }
 
-export default function UartTerminal({ config, onClear }: Props) {
+export default function UartTerminal({ config, interactive = true, onClear }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -82,7 +83,7 @@ export default function UartTerminal({ config, onClear }: Props) {
   }, [onClear]);
 
   const handleSend = useCallback(() => {
-    if (!inputText.trim()) return;
+    if (!interactive || !inputText.trim()) return;
 
     let bytes: number[];
     if (hexMode) {
@@ -100,7 +101,7 @@ export default function UartTerminal({ config, onClear }: Props) {
     sendUart(config.usart, bytes).catch(console.error);
     setInputText("");
     inputRef.current?.focus();
-  }, [inputText, hexMode, config.usart]);
+  }, [inputText, hexMode, config.usart, interactive]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -118,7 +119,7 @@ export default function UartTerminal({ config, onClear }: Props) {
       <div ref={containerRef} className="px-1 py-1" style={{ height: 200 }} />
 
       {/* Input bar */}
-      <div className="flex items-center gap-1.5 px-2 py-1.5 border-t border-[#3a3a5e] bg-[#181825]">
+      <div className={`flex items-center gap-1.5 px-2 py-1.5 border-t border-[#3a3a5e] bg-[#181825] ${!interactive ? "opacity-50 pointer-events-none" : ""}`}>
         <input
           ref={inputRef}
           type="text"
@@ -126,10 +127,12 @@ export default function UartTerminal({ config, onClear }: Props) {
           onChange={(e) => setInputText(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={hexMode ? "HEX: 48 65 6C 6C 6F" : "Type to send..."}
-          className="flex-1 bg-[#2a2a3e] border border-[#3a3a5e] rounded px-2 py-1 text-xs text-[#cdd6f4] font-mono focus:outline-none focus:border-indigo-500"
+          disabled={!interactive}
+          className="flex-1 bg-[#2a2a3e] border border-[#3a3a5e] rounded px-2 py-1 text-xs text-[#cdd6f4] font-mono focus:outline-none focus:border-indigo-500 disabled:opacity-50"
         />
         <button
           onClick={() => setHexMode((m) => !m)}
+          disabled={!interactive}
           className={`px-2 py-1 rounded text-xs font-mono border transition-colors ${
             hexMode
               ? "bg-indigo-600 border-indigo-500 text-white"
@@ -141,13 +144,15 @@ export default function UartTerminal({ config, onClear }: Props) {
         </button>
         <button
           onClick={handleClear}
+          disabled={!interactive}
           className="px-2 py-1 rounded text-xs text-[#6c7086] bg-[#2a2a3e] border border-[#3a3a5e] hover:text-[#cdd6f4] transition-colors"
         >
           Clear
         </button>
         <button
           onClick={handleSend}
-          className="px-3 py-1 rounded text-xs font-medium bg-indigo-600 hover:bg-indigo-500 text-white transition-colors"
+          disabled={!interactive}
+          className="px-3 py-1 rounded text-xs font-medium bg-indigo-600 hover:bg-indigo-500 text-white transition-colors disabled:opacity-50"
         >
           Send
         </button>

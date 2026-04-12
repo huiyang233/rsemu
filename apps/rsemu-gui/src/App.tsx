@@ -1,8 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { useAppStore } from "./store/appStore";
 import { useEmulatorEvents } from "./hooks/useEmulatorEvents";
-import SetupPage from "./pages/SetupPage";
-import SimulationPage from "./pages/SimulationPage";
+import WorkspacePage from "./pages/WorkspacePage";
 import WelcomePage from "./pages/WelcomePage";
 import {
   clearLastProject,
@@ -65,7 +64,7 @@ export default function App() {
             );
             setCanvasItems(project.canvas.items, false);
             setDirty(false);
-            setPage("setup");
+            setPage("workspace");
 
             const refreshed = await rememberProject(prefs.last_opened_project);
             if (!cancelled) {
@@ -111,5 +110,5 @@ export default function App() {
   }
 
   if (page === "welcome") return <WelcomePage />;
-  return page === "setup" ? <SetupPage /> : <SimulationPage />;
+  return <WorkspacePage />;
 }

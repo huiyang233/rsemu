@@ -20,7 +20,7 @@ export interface ProjectCanvas {
 }
 
 export interface ProjectUiState {
-  last_page?: "setup" | "simulation";
+  last_page?: "workspace";
 }
 
 export interface RsemuProjectFile {

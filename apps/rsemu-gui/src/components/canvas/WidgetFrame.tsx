@@ -1,5 +1,6 @@
 import React, { useCallback, useRef } from "react";
 import type { CanvasItem } from "../../types/peripheral";
+import type { LucideIcon } from "lucide-react";
 
 const GRID = 16;
 const snap = (v: number) => Math.round(v / GRID) * GRID;
@@ -7,14 +8,14 @@ const snap = (v: number) => Math.round(v / GRID) * GRID;
 interface WidgetFrameProps {
   item: CanvasItem;
   label: string;
-  icon: string;
+  icon: LucideIcon;
   onMove: (id: string, pos: { x: number; y: number }) => void;
   headerExtra?: React.ReactNode;
   children: React.ReactNode;
 }
 
-export default function WidgetFrame({ item, label, icon, onMove, headerExtra, children }: WidgetFrameProps) {
-  const pos = item.simPosition ?? { x: 0, y: 0 };
+export default function WidgetFrame({ item, label, icon: Icon, onMove, headerExtra, children }: WidgetFrameProps) {
+  const pos = item.position;
   const startPos = useRef<{ mouseX: number; mouseY: number; itemX: number; itemY: number } | null>(null);
 
   const handleMouseDown = useCallback(
@@ -59,7 +60,7 @@ export default function WidgetFrame({ item, label, icon, onMove, headerExtra, ch
         className="flex items-center gap-2 px-3 py-1.5 bg-[#313244] border-b border-[#3a3a5e] cursor-grab active:cursor-grabbing"
         onMouseDown={handleMouseDown}
       >
-        <span className="text-xs">{icon}</span>
+        <Icon className="w-3.5 h-3.5 text-[#a6adc8]" />
         <span className="text-xs font-medium text-[#cdd6f4] flex-1">{label}</span>
         {headerExtra}
         <span className="text-[#585b70] text-xs cursor-grab">⠿</span>

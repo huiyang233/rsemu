@@ -70,9 +70,7 @@ export interface CanvasItem {
   /** Unique instance ID (UUID) */
   instanceId: string;
   type: PeripheralType;
-  /** Position on the Setup page canvas */
+  /** Position on the workspace canvas */
   position: { x: number; y: number };
-  /** Position on the Simulation page (null = auto-layout on first render) */
-  simPosition: { x: number; y: number } | null;
   config: PeripheralConfig | null; // null until the user fills in pin assignments
 }

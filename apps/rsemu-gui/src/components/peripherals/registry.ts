@@ -1,6 +1,18 @@
 import type { PeripheralType, PeripheralConfig, CanvasItem, PinMapping } from "../../types/peripheral";
 import type { BoardInfo } from "../../types/board";
 import type { ComponentType } from "react";
+import type { LucideIcon } from "lucide-react";
+import { ToggleLeft, Monitor, Cable } from "lucide-react";
+
+// ── Categories ────────────────────────────────────────────────────────────────
+
+export type PeripheralCategory = "basic-io" | "display" | "communication";
+
+export const categoryMeta: Record<PeripheralCategory, { label: string; icon: LucideIcon }> = {
+  "basic-io":      { label: "Basic I/O",     icon: ToggleLeft },
+  "display":       { label: "Display",       icon: Monitor },
+  "communication": { label: "Communication",  icon: Cable },
+};
 
 // ── Module definition interface ───────────────────────────────────────────────
 
@@ -9,9 +21,10 @@ export interface PeripheralModuleDef {
   label: string;
   color: string;
   textColor: string;
-  icon: string;
+  icon: LucideIcon;
+  category: PeripheralCategory;
   PinConfig: ComponentType<PinConfigProps>;
-  Widget: ComponentType<{ config: any }>;
+  Widget: ComponentType<{ config: any; interactive?: boolean }>;
 }
 
 export interface PinConfigProps {
@@ -64,10 +77,10 @@ export const paletteEntries = allModules.map((m) => ({
   color: m.color,
   textColor: m.textColor,
   icon: m.icon,
+  category: m.category,
 }));
 
-// Backward compat: "st7789" was the old type before the SPI/FSMC split
-typeToDef.set("st7789" as PeripheralType, st7789SpiDef);
+export const categoryOrder: PeripheralCategory[] = ["basic-io", "display", "communication"];
 
 export function getPeripheralDef(type: PeripheralType): PeripheralModuleDef | undefined {
   return typeToDef.get(type);

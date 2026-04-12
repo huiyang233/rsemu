@@ -2,7 +2,7 @@ import { create } from "zustand";
 import type { BoardInfo } from "../types/board";
 import type { CanvasItem, PeripheralConfig } from "../types/peripheral";
 
-export type AppPage = "welcome" | "setup" | "simulation";
+export type AppPage = "welcome" | "workspace";
 
 interface AppState {
   // ── Navigation ──────────────────────────────────────────────────────────
@@ -36,12 +36,12 @@ interface AppState {
   updateCanvasItem: (instanceId: string, updates: Partial<CanvasItem>, markDirty?: boolean) => void;
   updateCanvasItemConfig: (instanceId: string, config: PeripheralConfig, markDirty?: boolean) => void;
   moveCanvasItem: (instanceId: string, position: { x: number; y: number }, markDirty?: boolean) => void;
-  moveSimItem: (instanceId: string, simPosition: { x: number; y: number }) => void;
 
   // ── Simulation runtime ───────────────────────────────────────────────────
   running: boolean;
   simError: string | null;
   steps: number;
+  simGen: number;
   setRunning: (running: boolean) => void;
   setSimError: (error: string | null) => void;
   setSteps: (steps: number) => void;
@@ -52,6 +52,8 @@ interface AppState {
   uartOutput: Record<string, string>;
   appendUartBytes: (peripheral: string, bytes: number[]) => void;
   clearUartOutput: (peripheral: string) => void;
+
+  resetSimState: () => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -114,17 +116,12 @@ export const useAppStore = create<AppState>((set) => ({
       ),
       dirty: s.dirty || markDirty,
     })),
-  moveSimItem: (instanceId, simPosition) =>
-    set((s) => ({
-      canvasItems: s.canvasItems.map((i) =>
-        i.instanceId === instanceId ? { ...i, simPosition } : i
-      ),
-    })),
 
   // ── Simulation runtime ───────────────────────────────────────────────────
   running: false,
   simError: null,
   steps: 0,
+  simGen: 0,
   setRunning: (running) => set({ running }),
   setSimError: (simError) => set({ simError }),
   setSteps: (steps) => set({ steps }),
@@ -144,4 +141,14 @@ export const useAppStore = create<AppState>((set) => ({
     }),
   clearUartOutput: (peripheral) =>
     set((s) => ({ uartOutput: { ...s.uartOutput, [peripheral]: "" } })),
+
+  resetSimState: () =>
+    set((s) => ({
+      running: false,
+      simError: null,
+      steps: 0,
+      ledStates: {},
+      uartOutput: {},
+      simGen: s.simGen + 1,
+    })),
 }));

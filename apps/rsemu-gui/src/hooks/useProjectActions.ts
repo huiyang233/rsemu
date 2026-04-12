@@ -132,7 +132,7 @@ export function useProjectActions() {
     setFirmwarePath(resolvedFirmwarePath, false);
     setCanvasItems(project.canvas.items, false);
     setDirty(false);
-    setPage("setup");
+    setPage("workspace");
 
     const prefs = await rememberProject(path);
     setRecentProjects(prefs.recent_projects);
@@ -164,7 +164,7 @@ export function useProjectActions() {
     setFirmwarePath("", false);
     setCanvasItems([], false);
     setDirty(true);
-    setPage("setup");
+    setPage("workspace");
     return true;
   }, [ensureSafeToProceed, setCanvasItems, setDirty, setFirmwarePath, setPage, setProjectMeta, setSelectedBoard]);
 
