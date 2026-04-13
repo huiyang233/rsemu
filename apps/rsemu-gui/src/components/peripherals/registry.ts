@@ -57,6 +57,8 @@ import { ssd1306Def } from "./ssd1306/def";
 import { ledDef } from "./led/def";
 import { buttonDef } from "./button/def";
 import { uartDef } from "./uart/def";
+import { potentiometerDef } from "./potentiometer/def";
+import { joystickDef } from "./joystick/def";
 
 const allModules: PeripheralModuleDef[] = [
   st7789SpiDef,
@@ -65,6 +67,8 @@ const allModules: PeripheralModuleDef[] = [
   ledDef,
   buttonDef,
   uartDef,
+  potentiometerDef,
+  joystickDef,
 ];
 
 export const typeToDef = new Map(allModules.map((m) => [m.type, m]));
