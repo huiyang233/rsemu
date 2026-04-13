@@ -507,6 +507,7 @@ fn run_machine<C: CpuCore>(
                         uart_batch_size,
                         frame_interval,
                         &mut next_frame_deadline,
+                        target_peripherals,
                     );
                     perf_event_ns = perf_event_ns.saturating_add(event_begin.elapsed().as_nanos());
                     perf_serial = perf_serial.saturating_add(ev_stats.serial_events as u64);
@@ -608,6 +609,7 @@ fn process_events<C: CpuCore>(
     uart_batch_size: usize,
     frame_interval: Duration,
     next_frame_deadline: &mut Instant,
+    target_peripherals: &[rsemu_core::PeripheralSpec],
 ) -> EventProcessStats {
     let mut stats = EventProcessStats::default();
 
@@ -632,6 +634,11 @@ fn process_events<C: CpuCore>(
     // ── MMIO write events → BusContext routing ──────────────────────────
     let mmio = machine.mmio_writes();
     stats.mmio_events = mmio.len().saturating_sub(*mmio_cursor);
+
+    // Collect ADC SWSTART events; we process them after the mmio loop because
+    // machine.read8/write8 cannot be called while mmio_writes() borrows machine.
+    let mut adc_swstart_sr_addrs: Vec<u64> = Vec::new();
+
     for event in &mmio[*mmio_cursor..] {
         let bus_stats = bus_ctx.dispatch_mmio(event);
         if has_display && bus_stats.display_activity {
@@ -644,8 +651,36 @@ fn process_events<C: CpuCore>(
         {
             let _ = clocks.apply_mmio(event);
         }
+
+        // ADC SWSTART emulation: when firmware writes SWSTART to ADC CR2,
+        // set STRT and EOC in SR so the polling loop completes.
+        // The DR value retains whatever was last set by InjectAdc.
+        if event.register.eq_ignore_ascii_case("CR2")
+            && event.peripheral.to_ascii_uppercase().starts_with("ADC")
+            && (event.value & (1u32 << 30)) != 0 // SWSTART bit
+        {
+            if let Ok((sr_addr, _)) = adc_sr_dr_addrs(&event.peripheral, target_peripherals) {
+                adc_swstart_sr_addrs.push(sr_addr);
+            }
+        }
     }
     *mmio_cursor = mmio.len();
+
+    // Process ADC SWSTART events (machine is no longer borrowed by mmio)
+    for sr_addr in adc_swstart_sr_addrs {
+        let b0 = machine.read8(sr_addr).unwrap_or(0);
+        let b1 = machine.read8(sr_addr + 1).unwrap_or(0);
+        let b2 = machine.read8(sr_addr + 2).unwrap_or(0);
+        let b3 = machine.read8(sr_addr + 3).unwrap_or(0);
+        let sr = u32::from_le_bytes([b0, b1, b2, b3])
+            | (1u32 << 4) // STRT
+            | (1u32 << 1); // EOC
+        let bytes = sr.to_le_bytes();
+        let _ = machine.write8(sr_addr,     bytes[0]);
+        let _ = machine.write8(sr_addr + 1, bytes[1]);
+        let _ = machine.write8(sr_addr + 2, bytes[2]);
+        let _ = machine.write8(sr_addr + 3, bytes[3]);
+    }
 
     // ── Display frame (wall-clock throttled, render unlocked from step count) ──
     if Instant::now() >= *next_frame_deadline {
