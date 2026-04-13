@@ -4,7 +4,7 @@ use rsemu_core::cpu::armv7em::CortexM4;
 use rsemu_core::cpu::armv7m::CortexM3;
 use rsemu_core::{
     BusContext, CpuCore, CpuType, FirmwareLoader, GpioPin, Machine, RccClockModel,
-    SpiBus, StepBatchController, TargetSpec, gpio_port_letter,
+    SpiBus, StepBatchController, TargetSpec, adc_sr_dr_addrs, gpio_port_letter,
 };
 use rsemu_peripherals::display::St7789;
 use rsemu_peripherals::led::Led;
@@ -310,6 +310,7 @@ fn run_with_cpu<C: CpuCore>(
                             &mut uart_terminals,
                             active_uart_filters.as_deref(),
                             &mut display_gui,
+                            &target.peripherals,
                         );
                         steps_since_stream = 0;
                     }
@@ -348,6 +349,7 @@ fn run_with_cpu<C: CpuCore>(
                 &mut uart_terminals,
                 active_uart_filters.as_deref(),
                 &mut display_gui,
+                &target.peripherals,
             );
         }
 
@@ -384,6 +386,7 @@ fn stream_new_events<C: CpuCore>(
     uart_terminals: &mut [UartTerminalConsole],
     active_uart_filters: Option<&[String]>,
     display_gui: &mut Option<DisplayWindow>,
+    target_peripherals: &[rsemu_core::PeripheralSpec],
 ) {
     let has_uart_terminals = !uart_terminals.is_empty();
 
@@ -415,6 +418,11 @@ fn stream_new_events<C: CpuCore>(
 
     // ── MMIO write events → BusContext routing ──────────────────────────
     let mmio_events = machine.mmio_writes();
+
+    // Collect ADC SWSTART events for deferred processing (can't borrow machine
+    // while mmio_events holds a reference).
+    let mut adc_swstart_sr_addrs: Vec<u64> = Vec::new();
+
     for event in &mmio_events[*mmio_cursor..] {
         let _stats = bus_ctx.dispatch_mmio(event);
 
@@ -429,9 +437,35 @@ fn stream_new_events<C: CpuCore>(
         {
             pacer.set_core_clock_hz(new_core_hz);
         }
+
+        // ADC SWSTART emulation: collect for deferred processing
+        if event.register.eq_ignore_ascii_case("CR2")
+            && event.peripheral.to_ascii_uppercase().starts_with("ADC")
+            && (event.value & (1u32 << 30)) != 0
+        {
+            if let Ok((sr_addr, _)) = adc_sr_dr_addrs(&event.peripheral, target_peripherals) {
+                adc_swstart_sr_addrs.push(sr_addr);
+            }
+        }
     }
     let _ = bus_ctx; // suppress unused warning if no devices
     *mmio_cursor = mmio_events.len();
+
+    // Process ADC SWSTART events (machine no longer borrowed by mmio_events)
+    for sr_addr in adc_swstart_sr_addrs {
+        let b0 = machine.read8(sr_addr).unwrap_or(0);
+        let b1 = machine.read8(sr_addr + 1).unwrap_or(0);
+        let b2 = machine.read8(sr_addr + 2).unwrap_or(0);
+        let b3 = machine.read8(sr_addr + 3).unwrap_or(0);
+        let sr = u32::from_le_bytes([b0, b1, b2, b3])
+            | (1u32 << 4)  // STRT
+            | (1u32 << 1); // EOC
+        let bytes = sr.to_le_bytes();
+        let _ = machine.write8(sr_addr,     bytes[0]);
+        let _ = machine.write8(sr_addr + 1, bytes[1]);
+        let _ = machine.write8(sr_addr + 2, bytes[2]);
+        let _ = machine.write8(sr_addr + 3, bytes[3]);
+    }
 
     // ── Display frame capture ───────────────────────────────────────────
     if let Some(window) = display_gui.as_mut() {

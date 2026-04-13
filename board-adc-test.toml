@@ -1,0 +1,8 @@
+target = "stm32f407"
+firmware = "firmware/adc-input-test-f407.bin"
+
+[[peripherals]]
+type = "uart"
+usart = "USART1"
+tx = { port = "A", pin = 9 }
+rx = { port = "A", pin = 10 }
