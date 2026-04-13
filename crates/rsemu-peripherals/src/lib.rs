@@ -58,6 +58,26 @@ pub enum PeripheralConfig {
         id: String,
         pin: PinMapping,
     },
+    #[serde(rename = "potentiometer")]
+    Potentiometer {
+        id: String,
+        pin: PinMapping,
+        #[serde(default = "default_adc1")]
+        adc: String,
+        /// "horizontal" or "vertical"
+        #[serde(default = "default_horizontal")]
+        orientation: String,
+    },
+    #[serde(rename = "joystick")]
+    Joystick {
+        id: String,
+        pin_x: PinMapping,
+        pin_y: PinMapping,
+        #[serde(default = "default_adc1")]
+        adc_x: String,
+        #[serde(default = "default_adc1")]
+        adc_y: String,
+    },
     /// Escape hatch: allows board.toml to declare peripheral types not
     /// yet known as first-class variants. The `params` map is passed
     /// through verbatim — the app layer can use it to instantiate custom
@@ -78,4 +98,12 @@ fn default_true() -> bool {
 
 fn default_ssd1306_addr() -> u8 {
     0x3c
+}
+
+fn default_adc1() -> String {
+    "ADC1".to_string()
+}
+
+fn default_horizontal() -> String {
+    "horizontal".to_string()
 }
