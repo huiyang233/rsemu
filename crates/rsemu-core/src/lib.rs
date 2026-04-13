@@ -18,7 +18,7 @@ pub use bus::{
 };
 pub use clock::RccClockModel;
 pub use cpu::{ArchitectureId, CpuArchitecture, CpuCore};
-pub use execution::{gpio_idr_addr, gpio_port_letter, StepBatchController};
+pub use execution::{adc_sr_dr_addrs, gpio_idr_addr, gpio_port_letter, pin_to_adc_channel, StepBatchController};
 pub use image::{FirmwareFormat, FirmwareLoader};
 pub use machine::{
     Machine, MachineBusInterface, MmioWriteEvent, SerialEvent,

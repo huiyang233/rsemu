@@ -106,3 +106,126 @@ pub fn gpio_idr_addr(port: char, peripherals: &[PeripheralSpec]) -> Result<u64, 
     let idr_offset = idr.address - gpioa.base_address;
     Ok(gpioa.base_address + idx * 0x400 + idr_offset)
 }
+
+/// Map a GPIO pin to its STM32 ADC channel number.
+///
+/// Standard mapping (same for F1/F4):
+/// - PA0-PA7 → CH 0-7
+/// - PB0-PB1 → CH 8-9
+/// - PC0-PC5 → CH 10-15
+/// - Others  → Err
+pub fn pin_to_adc_channel(port: char, pin: u8) -> Result<u8, String> {
+    match port.to_ascii_uppercase() {
+        'A' if pin <= 7 => Ok(pin),
+        'B' if pin <= 1 => Ok(8 + pin),
+        'C' if pin <= 5 => Ok(10 + pin),
+        _ => Err(format!(
+            "GPIO{}{} has no ADC channel mapping",
+            port.to_ascii_uppercase(),
+            pin
+        )),
+    }
+}
+
+/// Look up the SR and DR register addresses for a named ADC peripheral.
+///
+/// Returns `(sr_addr, dr_addr)` from the SVD peripheral list.
+/// The lookup is case-insensitive on the peripheral name.
+pub fn adc_sr_dr_addrs(
+    peripheral_name: &str,
+    peripherals: &[PeripheralSpec],
+) -> Result<(u64, u64), String> {
+    let adc = peripherals
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(peripheral_name))
+        .ok_or_else(|| format!("ADC peripheral '{}' not found in target spec", peripheral_name))?;
+
+    let sr = adc
+        .registers
+        .iter()
+        .find(|r| r.name == "SR")
+        .ok_or_else(|| format!("SR register not found in {}", adc.name))?;
+    let dr = adc
+        .registers
+        .iter()
+        .find(|r| r.name == "DR")
+        .ok_or_else(|| format!("DR register not found in {}", adc.name))?;
+
+    Ok((sr.address, dr.address))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::target::RegisterSpec;
+
+    /// Helper: create a PeripheralSpec named "ADC1" with SR at `base` and DR at `base + 0x4C`.
+    fn make_adc(base: u64) -> PeripheralSpec {
+        PeripheralSpec {
+            name: "ADC1".to_string(),
+            base_address: base,
+            registers: vec![
+                RegisterSpec {
+                    name: "SR".to_string(),
+                    address: base,
+                    width_bits: 32,
+                    reset_value: 0,
+                },
+                RegisterSpec {
+                    name: "DR".to_string(),
+                    address: base + 0x4C,
+                    width_bits: 32,
+                    reset_value: 0,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_pin_to_adc_channel_pa() {
+        assert_eq!(pin_to_adc_channel('A', 0).unwrap(), 0);
+        assert_eq!(pin_to_adc_channel('A', 7).unwrap(), 7);
+    }
+
+    #[test]
+    fn test_pin_to_adc_channel_pb() {
+        assert_eq!(pin_to_adc_channel('B', 0).unwrap(), 8);
+        assert_eq!(pin_to_adc_channel('B', 1).unwrap(), 9);
+    }
+
+    #[test]
+    fn test_pin_to_adc_channel_pc() {
+        assert_eq!(pin_to_adc_channel('C', 0).unwrap(), 10);
+        assert_eq!(pin_to_adc_channel('C', 5).unwrap(), 15);
+    }
+
+    #[test]
+    fn test_pin_to_adc_channel_invalid() {
+        assert!(pin_to_adc_channel('D', 0).is_err());
+        assert!(pin_to_adc_channel('B', 2).is_err());
+    }
+
+    #[test]
+    fn test_adc_sr_dr_addrs() {
+        let base: u64 = 0x4001_2400;
+        let peripherals = vec![make_adc(base)];
+        let (sr, dr) = adc_sr_dr_addrs("ADC1", &peripherals).unwrap();
+        assert_eq!(sr, base);
+        assert_eq!(dr, base + 0x4C);
+    }
+
+    #[test]
+    fn test_adc_sr_dr_addrs_case_insensitive() {
+        let base: u64 = 0x4001_2400;
+        let peripherals = vec![make_adc(base)];
+        let (sr, dr) = adc_sr_dr_addrs("adc1", &peripherals).unwrap();
+        assert_eq!(sr, base);
+        assert_eq!(dr, base + 0x4C);
+    }
+
+    #[test]
+    fn test_adc_sr_dr_addrs_not_found() {
+        let peripherals = vec![make_adc(0x4001_2400)];
+        assert!(adc_sr_dr_addrs("ADC3", &peripherals).is_err());
+    }
+}
