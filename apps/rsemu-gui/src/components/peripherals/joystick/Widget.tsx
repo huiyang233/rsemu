@@ -12,10 +12,11 @@ const HANDLE_R = 16; // radius of the draggable handle (px)
 const MAX_TRAVEL = BASE_R - HANDLE_R; // max displacement from center
 
 export default function JoystickWidget({ config, interactive = true }: Props) {
-  // Normalized position: -1..1 for both axes
   const [pos, setPos] = useState({ x: 0, y: 0 });
   const [dragging, setDragging] = useState(false);
   const baseRef = useRef<HTMLDivElement>(null);
+
+  const valid = !!(config.pin_x && config.pin_y);
 
   const getClampedPos = useCallback((clientX: number, clientY: number) => {
     if (!baseRef.current) return { x: 0, y: 0 };
@@ -31,6 +32,7 @@ export default function JoystickWidget({ config, interactive = true }: Props) {
 
   const injectPos = useCallback(
     async (nx: number, ny: number) => {
+      if (!config.pin_x || !config.pin_y) return;
       const xVal = Math.round(((nx + 1) / 2) * 4095);
       const yVal = Math.round(((ny + 1) / 2) * 4095);
       await injectAdc(config.adc_x, pinToAdcChannel(config.pin_x), xVal);
@@ -63,6 +65,10 @@ export default function JoystickWidget({ config, interactive = true }: Props) {
       window.removeEventListener("pointerup", handlePointerUp);
     };
   }, [dragging, handlePointerMove, handlePointerUp]);
+
+  if (!valid) {
+    return <div className="p-4 text-xs text-[#585b70] text-center">Not configured</div>;
+  }
 
   const handleX = pos.x * MAX_TRAVEL;
   const handleY = pos.y * MAX_TRAVEL;

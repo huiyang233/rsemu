@@ -11,6 +11,8 @@ export default function PotentiometerWidget({ config, interactive = true }: Prop
   const [value, setValue] = useState(2048);
   const [dragging, setDragging] = useState(false);
   const trackRef = useRef<HTMLDivElement>(null);
+
+  const valid = !!config.pin;
   const isHorizontal = config.orientation !== "vertical";
 
   const computeValue = useCallback(
@@ -27,11 +29,16 @@ export default function PotentiometerWidget({ config, interactive = true }: Prop
 
   const handleInject = useCallback(
     async (raw: number) => {
+      if (!config.pin) return;
       const channel = pinToAdcChannel(config.pin);
       await injectAdc(config.adc, channel, raw);
     },
     [config],
   );
+
+  if (!valid) {
+    return <div className="p-4 text-xs text-[#585b70] text-center">Not configured</div>;
+  }
 
   const percent = (value / 4095) * 100;
 
