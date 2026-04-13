@@ -110,7 +110,7 @@ fn normalize_ssd1306_size(width: u16, height: u16) -> (u16, u16) {
 }
 
 use rsemu_core::{
-    BusContext, CpuCore, CpuType, FirmwareLoader, GpioPin, I2cBus, Machine,
+    adc_sr_dr_addrs, BusContext, CpuCore, CpuType, FirmwareLoader, GpioPin, I2cBus, Machine,
     RccClockModel, SpiBus, StepBatchController, gpio_idr_addr,
 };
 use rsemu_peripherals::display::St7789;
@@ -319,8 +319,19 @@ fn run_machine<C: CpuCore>(
                 eprintln!("[EMU]   [{}] Custom peripheral '{}' ({} params) — skipped, no handler",
                     idx, type_name, params.len());
             }
-            PeripheralConfig::Potentiometer { .. } | PeripheralConfig::Joystick { .. } => {
-                // TODO: Task 4 — instantiate ADC peripherals
+            PeripheralConfig::Potentiometer { id, pin, adc, orientation } => {
+                eprintln!(
+                    "[EMU]   [{}] Potentiometer '{}' on P{}{} → {} ({} layout)",
+                    idx, id, pin.port, pin.pin, adc, orientation
+                );
+            }
+            PeripheralConfig::Joystick { id, pin_x, pin_y, adc_x, adc_y } => {
+                eprintln!(
+                    "[EMU]   [{}] Joystick '{}': X=P{}{}/{}  Y=P{}{}/{}",
+                    idx, id,
+                    pin_x.port, pin_x.pin, adc_x,
+                    pin_y.port, pin_y.pin, adc_y
+                );
             }
         }
     }
@@ -433,8 +444,30 @@ fn run_machine<C: CpuCore>(
                         let _ = machine.usart_push_rx_byte(&peripheral, byte);
                     }
                 }
-                Ok(ControlMsg::InjectAdc { peripheral: _, channel: _, value: _ }) => {
-                    // TODO: Task 4 — forward to ADC peripheral
+                Ok(ControlMsg::InjectAdc { peripheral, channel: _, value }) => {
+                    match adc_sr_dr_addrs(&peripheral, target_peripherals) {
+                        Ok((sr_addr, dr_addr)) => {
+                            // Write 12-bit value to DR
+                            let dr_val = (value & 0x0FFF) as u32;
+                            let dr_bytes = dr_val.to_le_bytes();
+                            let _ = machine.write8(dr_addr,     dr_bytes[0]);
+                            let _ = machine.write8(dr_addr + 1, dr_bytes[1]);
+                            let _ = machine.write8(dr_addr + 2, dr_bytes[2]);
+                            let _ = machine.write8(dr_addr + 3, dr_bytes[3]);
+                            // Set EOC flag (bit 1) in SR so firmware polling loop exits
+                            let b0 = machine.read8(sr_addr).unwrap_or(0);
+                            let b1 = machine.read8(sr_addr + 1).unwrap_or(0);
+                            let b2 = machine.read8(sr_addr + 2).unwrap_or(0);
+                            let b3 = machine.read8(sr_addr + 3).unwrap_or(0);
+                            let sr = u32::from_le_bytes([b0, b1, b2, b3]) | (1u32 << 1);
+                            let sr_bytes = sr.to_le_bytes();
+                            let _ = machine.write8(sr_addr,     sr_bytes[0]);
+                            let _ = machine.write8(sr_addr + 1, sr_bytes[1]);
+                            let _ = machine.write8(sr_addr + 2, sr_bytes[2]);
+                            let _ = machine.write8(sr_addr + 3, sr_bytes[3]);
+                        }
+                        Err(e) => eprintln!("[EMU] InjectAdc: {e}"),
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
             }
