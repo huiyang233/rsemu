@@ -34,6 +34,27 @@ export async function injectGpio(port: string, pin: number, high: boolean): Prom
   return invoke("inject_gpio", { port, pin, high });
 }
 
+export async function injectAdc(
+  peripheral: string,
+  channel: number,
+  value: number,
+): Promise<void> {
+  return invoke("inject_adc", { peripheral, channel, value });
+}
+
+/**
+ * Compute the STM32 ADC channel number for a GPIO pin.
+ * PA0-PA7 → CH0-7, PB0-PB1 → CH8-9, PC0-PC5 → CH10-15.
+ * Returns 0 for any unrecognised pin (fails silently — emulator will log the error).
+ */
+export function pinToAdcChannel(pin: { port: string; pin: number }): number {
+  const port = pin.port.toUpperCase();
+  if (port === "A" && pin.pin < 8) return pin.pin;
+  if (port === "B" && pin.pin < 2) return 8 + pin.pin;
+  if (port === "C" && pin.pin < 6) return 10 + pin.pin;
+  return 0;
+}
+
 export async function sendUart(peripheral: string, bytes: number[]): Promise<void> {
   return invoke("send_uart", { peripheral, bytes });
 }

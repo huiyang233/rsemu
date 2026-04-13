@@ -9,7 +9,9 @@ export type PeripheralType =
   | "ssd1306_i2c"
   | "led"
   | "button"
-  | "uart";
+  | "uart"
+  | "potentiometer"
+  | "joystick";
 
 // ── Per-peripheral config payloads (sent to Rust backend) ────────────────────
 
@@ -56,13 +58,32 @@ export interface ButtonConfig {
   pin: PinMapping;
 }
 
+export interface PotentiometerConfig {
+  type: "potentiometer";
+  id: string;
+  pin: PinMapping;
+  adc: string;
+  orientation: "horizontal" | "vertical";
+}
+
+export interface JoystickConfig {
+  type: "joystick";
+  id: string;
+  pin_x: PinMapping;
+  pin_y: PinMapping;
+  adc_x: string;
+  adc_y: string;
+}
+
 export type PeripheralConfig =
   | St7789SpiConfig
   | St7789FsmcConfig
   | Ssd1306I2cConfig
   | LedConfig
   | UartConfig
-  | ButtonConfig;
+  | ButtonConfig
+  | PotentiometerConfig
+  | JoystickConfig;
 
 // ── Canvas item (what the setup page tracks) ─────────────────────────────────
 
