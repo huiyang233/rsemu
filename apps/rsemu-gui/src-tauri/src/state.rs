@@ -9,6 +9,7 @@ pub enum ControlMsg {
     Stop,
     InjectGpio { port: String, pin: u8, high: bool },
     SendUart { peripheral: String, bytes: Vec<u8> },
+    InjectAdc { peripheral: String, channel: u8, value: u16 },
 }
 
 /// Shared Tauri-managed state for the emulator.

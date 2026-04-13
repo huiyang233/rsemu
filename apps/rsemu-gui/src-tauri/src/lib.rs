@@ -33,6 +33,7 @@ pub fn run() {
             commands::start_simulation,
             commands::stop_simulation,
             commands::inject_gpio,
+            commands::inject_adc,
             commands::send_uart,
             commands::open_firmware_dialog,
             commands::get_app_preferences,

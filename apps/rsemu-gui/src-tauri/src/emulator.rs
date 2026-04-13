@@ -319,6 +319,9 @@ fn run_machine<C: CpuCore>(
                 eprintln!("[EMU]   [{}] Custom peripheral '{}' ({} params) — skipped, no handler",
                     idx, type_name, params.len());
             }
+            PeripheralConfig::Potentiometer { .. } | PeripheralConfig::Joystick { .. } => {
+                // TODO: Task 4 — instantiate ADC peripherals
+            }
         }
     }
 
@@ -429,6 +432,9 @@ fn run_machine<C: CpuCore>(
                     for byte in bytes {
                         let _ = machine.usart_push_rx_byte(&peripheral, byte);
                     }
+                }
+                Ok(ControlMsg::InjectAdc { peripheral: _, channel: _, value: _ }) => {
+                    // TODO: Task 4 — forward to ADC peripheral
                 }
                 Err(TryRecvError::Empty) => break,
             }

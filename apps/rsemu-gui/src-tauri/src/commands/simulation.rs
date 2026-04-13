@@ -77,6 +77,21 @@ pub fn send_uart(
 }
 
 #[tauri::command]
+pub fn inject_adc(
+    state: State<'_, Mutex<SimState>>,
+    peripheral: String,
+    channel: u8,
+    value: u16,
+) -> Result<(), String> {
+    let guard = state.lock().map_err(|e| e.to_string())?;
+    if let Some(tx) = &guard.control_tx {
+        tx.send(ControlMsg::InjectAdc { peripheral, channel, value })
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn open_firmware_dialog(app: AppHandle) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
     let path = app
