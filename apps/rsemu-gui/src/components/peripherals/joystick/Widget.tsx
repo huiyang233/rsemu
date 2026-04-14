@@ -18,6 +18,15 @@ export default function JoystickWidget({ config, interactive = true }: Props) {
 
   const valid = !!(config.pin_x && config.pin_y);
 
+  // Inject default center values on mount
+  useEffect(() => {
+    if (!config.pin_x || !config.pin_y) return;
+    const chX = pinToAdcChannel(config.pin_x);
+    const chY = pinToAdcChannel(config.pin_y);
+    injectAdc(config.adc_x, chX, 2048);
+    injectAdc(config.adc_y, chY, 2048);
+  }, [config.adc_x, config.adc_y, config.pin_x, config.pin_y]);
+
   const getClampedPos = useCallback((clientX: number, clientY: number) => {
     if (!baseRef.current) return { x: 0, y: 0 };
     const rect = baseRef.current.getBoundingClientRect();

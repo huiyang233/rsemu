@@ -110,7 +110,7 @@ fn normalize_ssd1306_size(width: u16, height: u16) -> (u16, u16) {
 }
 
 use rsemu_core::{
-    adc_sr_dr_addrs, BusContext, CpuCore, CpuType, FirmwareLoader, GpioPin, I2cBus, Machine,
+    adc_regs_addrs, BusContext, CpuCore, CpuType, FirmwareLoader, GpioPin, I2cBus, Machine,
     RccClockModel, SpiBus, StepBatchController, gpio_idr_addr,
 };
 use rsemu_peripherals::display::St7789;
@@ -120,6 +120,8 @@ use rsemu_peripherals::{PeripheralConfig, PinMapping};
 use serde::Serialize;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use tauri::AppHandle;
+
+use std::collections::HashMap;
 
 use crate::state::{ControlMsg, SimConfig};
 
@@ -410,8 +412,10 @@ fn run_machine<C: CpuCore>(
     let mut perf_event_ns = 0u128;
     let mut perf_frame_encode_ns = 0u128;
 
+    // Per-channel injected ADC values: (peripheral_name, channel) → value
+    let mut adc_injected: HashMap<(String, u8), u16> = HashMap::new();
+
     loop {
-        // Drain all pending control messages
         loop {
             match control_rx.try_recv() {
                 Ok(ControlMsg::Stop) | Err(TryRecvError::Disconnected) => {
@@ -444,29 +448,14 @@ fn run_machine<C: CpuCore>(
                         let _ = machine.usart_push_rx_byte(&peripheral, byte);
                     }
                 }
-                Ok(ControlMsg::InjectAdc { peripheral, channel: _, value }) => {
-                    match adc_sr_dr_addrs(&peripheral, target_peripherals) {
-                        Ok((sr_addr, dr_addr)) => {
-                            // Write 12-bit value to DR
-                            let dr_val = (value & 0x0FFF) as u32;
-                            let dr_bytes = dr_val.to_le_bytes();
-                            let _ = machine.write8(dr_addr,     dr_bytes[0]);
-                            let _ = machine.write8(dr_addr + 1, dr_bytes[1]);
-                            let _ = machine.write8(dr_addr + 2, dr_bytes[2]);
-                            let _ = machine.write8(dr_addr + 3, dr_bytes[3]);
-                            // Set EOC flag (bit 1) in SR so firmware polling loop exits
-                            let b0 = machine.read8(sr_addr).unwrap_or(0);
-                            let b1 = machine.read8(sr_addr + 1).unwrap_or(0);
-                            let b2 = machine.read8(sr_addr + 2).unwrap_or(0);
-                            let b3 = machine.read8(sr_addr + 3).unwrap_or(0);
-                            let sr = u32::from_le_bytes([b0, b1, b2, b3]) | (1u32 << 1);
-                            let sr_bytes = sr.to_le_bytes();
-                            let _ = machine.write8(sr_addr,     sr_bytes[0]);
-                            let _ = machine.write8(sr_addr + 1, sr_bytes[1]);
-                            let _ = machine.write8(sr_addr + 2, sr_bytes[2]);
-                            let _ = machine.write8(sr_addr + 3, sr_bytes[3]);
-                        }
-                        Err(e) => eprintln!("[EMU] InjectAdc: {e}"),
+                Ok(ControlMsg::InjectAdc { peripheral: _, channel, value }) => {
+                    // Store the value under ALL ADC peripherals so the lookup
+                    // works regardless of which ADC the firmware actually uses
+                    // (the frontend might say ADC1 but the firmware uses ADC2).
+                    for p in target_peripherals.iter()
+                        .filter(|p| p.name.to_ascii_uppercase().starts_with("ADC"))
+                    {
+                        adc_injected.insert((p.name.to_ascii_uppercase(), channel), value);
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -508,6 +497,7 @@ fn run_machine<C: CpuCore>(
                         frame_interval,
                         &mut next_frame_deadline,
                         target_peripherals,
+                        &adc_injected,
                     );
                     perf_event_ns = perf_event_ns.saturating_add(event_begin.elapsed().as_nanos());
                     perf_serial = perf_serial.saturating_add(ev_stats.serial_events as u64);
@@ -610,6 +600,7 @@ fn process_events<C: CpuCore>(
     frame_interval: Duration,
     next_frame_deadline: &mut Instant,
     target_peripherals: &[rsemu_core::PeripheralSpec],
+    adc_injected: &HashMap<(String, u8), u16>,
 ) -> EventProcessStats {
     let mut stats = EventProcessStats::default();
 
@@ -637,7 +628,7 @@ fn process_events<C: CpuCore>(
 
     // Collect ADC SWSTART events; we process them after the mmio loop because
     // machine.read8/write8 cannot be called while mmio_writes() borrows machine.
-    let mut adc_swstart_sr_addrs: Vec<u64> = Vec::new();
+    let mut adc_swstart_sr_addrs: Vec<String> = Vec::new();
 
     for event in &mmio[*mmio_cursor..] {
         let bus_stats = bus_ctx.dispatch_mmio(event);
@@ -653,33 +644,76 @@ fn process_events<C: CpuCore>(
         }
 
         // ADC SWSTART emulation: when firmware writes SWSTART to ADC CR2,
-        // set STRT and EOC in SR so the polling loop completes.
-        // The DR value retains whatever was last set by InjectAdc.
+        // look up the channel from SQR3, inject the per-channel value into DR,
+        // and set STRT + EOC in SR so the polling loop completes.
         if event.register.eq_ignore_ascii_case("CR2")
             && event.peripheral.to_ascii_uppercase().starts_with("ADC")
             && (event.value & (1u32 << 30)) != 0 // SWSTART bit
         {
-            if let Ok((sr_addr, _)) = adc_sr_dr_addrs(&event.peripheral, target_peripherals) {
-                adc_swstart_sr_addrs.push(sr_addr);
-            }
+            // Defer: store the peripheral name for processing after the MMIO loop
+            adc_swstart_sr_addrs.push(event.peripheral.to_ascii_uppercase());
         }
     }
     *mmio_cursor = mmio.len();
 
     // Process ADC SWSTART events (machine is no longer borrowed by mmio)
-    for sr_addr in adc_swstart_sr_addrs {
-        let b0 = machine.read8(sr_addr).unwrap_or(0);
-        let b1 = machine.read8(sr_addr + 1).unwrap_or(0);
-        let b2 = machine.read8(sr_addr + 2).unwrap_or(0);
-        let b3 = machine.read8(sr_addr + 3).unwrap_or(0);
-        let sr = u32::from_le_bytes([b0, b1, b2, b3])
-            | (1u32 << 4) // STRT
-            | (1u32 << 1); // EOC
-        let bytes = sr.to_le_bytes();
-        let _ = machine.write8(sr_addr,     bytes[0]);
-        let _ = machine.write8(sr_addr + 1, bytes[1]);
-        let _ = machine.write8(sr_addr + 2, bytes[2]);
-        let _ = machine.write8(sr_addr + 3, bytes[3]);
+    for adc_name in adc_swstart_sr_addrs {
+        if let Ok((sr_addr, dr_addr, sqr3_addr, cr2_addr)) =
+            adc_regs_addrs(&adc_name, target_peripherals)
+        {
+            // Clear SWSTART bit (bit 30) in CR2 — on real hardware this is a
+            // write-only trigger that always reads as 0.  Without clearing it,
+            // subsequent CR2 read-modify-write operations carry the stale bit
+            // and trigger spurious SWSTART events with wrong SQR3 channels.
+            {
+                let b0 = machine.read8(cr2_addr).unwrap_or(0);
+                let b1 = machine.read8(cr2_addr + 1).unwrap_or(0);
+                let b2 = machine.read8(cr2_addr + 2).unwrap_or(0);
+                let b3 = machine.read8(cr2_addr + 3).unwrap_or(0);
+                let cr2 = u32::from_le_bytes([b0, b1, b2, b3]) & !(1u32 << 30);
+                let bytes = cr2.to_le_bytes();
+                let _ = machine.write8(cr2_addr,     bytes[0]);
+                let _ = machine.write8(cr2_addr + 1, bytes[1]);
+                let _ = machine.write8(cr2_addr + 2, bytes[2]);
+                let _ = machine.write8(cr2_addr + 3, bytes[3]);
+            }
+
+            // Read the first conversion channel from SQR3 bits [4:0]
+            let ch = (u32::from_le_bytes([
+                machine.read_mmio(sqr3_addr),
+                machine.read_mmio(sqr3_addr + 1),
+                machine.read_mmio(sqr3_addr + 2),
+                machine.read_mmio(sqr3_addr + 3),
+            ]) & 0x1F) as u8;
+
+            // Look up the injected value for this peripheral + channel
+            let injected_val = adc_injected
+                .get(&(adc_name.clone(), ch))
+                .copied()
+                .unwrap_or(0) as u32;
+
+            // Write the value to DR
+            let dr_bytes = injected_val.to_le_bytes();
+            let _ = machine.write8(dr_addr,     dr_bytes[0]);
+            let _ = machine.write8(dr_addr + 1, dr_bytes[1]);
+            let _ = machine.write8(dr_addr + 2, dr_bytes[2]);
+            let _ = machine.write8(dr_addr + 3, dr_bytes[3]);
+
+            // Set STRT (bit 4) + EOC (bit 1) in SR
+            let b0 = machine.read8(sr_addr).unwrap_or(0);
+            let b1 = machine.read8(sr_addr + 1).unwrap_or(0);
+            let b2 = machine.read8(sr_addr + 2).unwrap_or(0);
+            let b3 = machine.read8(sr_addr + 3).unwrap_or(0);
+            let sr = u32::from_le_bytes([b0, b1, b2, b3])
+                | (1u32 << 4) // STRT
+                | (1u32 << 1); // EOC
+            let bytes = sr.to_le_bytes();
+            let _ = machine.write8(sr_addr,     bytes[0]);
+            let _ = machine.write8(sr_addr + 1, bytes[1]);
+            let _ = machine.write8(sr_addr + 2, bytes[2]);
+            let _ = machine.write8(sr_addr + 3, bytes[3]);
+        }
+        // adc_regs_addrs failure is silently ignored (peripheral may not exist in target spec)
     }
 
     // ── Display frame (wall-clock throttled, render unlocked from step count) ──

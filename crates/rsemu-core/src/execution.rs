@@ -154,6 +154,43 @@ pub fn adc_sr_dr_addrs(
     Ok((sr.address, dr.address))
 }
 
+/// Look up the SR, DR, SQR3, and CR2 register addresses for a named ADC peripheral.
+///
+/// Returns `(sr_addr, dr_addr, sqr3_addr, cr2_addr)`.
+/// SQR3 bits [4:0] contain the first conversion channel (SQ1).
+pub fn adc_regs_addrs(
+    peripheral_name: &str,
+    peripherals: &[PeripheralSpec],
+) -> Result<(u64, u64, u64, u64), String> {
+    let adc = peripherals
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(peripheral_name))
+        .ok_or_else(|| format!("ADC peripheral '{}' not found in target spec", peripheral_name))?;
+
+    let sr = adc
+        .registers
+        .iter()
+        .find(|r| r.name == "SR")
+        .ok_or_else(|| format!("SR register not found in {}", adc.name))?;
+    let dr = adc
+        .registers
+        .iter()
+        .find(|r| r.name == "DR")
+        .ok_or_else(|| format!("DR register not found in {}", adc.name))?;
+    let sqr3 = adc
+        .registers
+        .iter()
+        .find(|r| r.name == "SQR3")
+        .ok_or_else(|| format!("SQR3 register not found in {}", adc.name))?;
+    let cr2 = adc
+        .registers
+        .iter()
+        .find(|r| r.name == "CR2")
+        .ok_or_else(|| format!("CR2 register not found in {}", adc.name))?;
+
+    Ok((sr.address, dr.address, sqr3.address, cr2.address))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

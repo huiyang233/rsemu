@@ -1109,7 +1109,26 @@ impl SystemBus for MachineBus<'_> {
         {
             return block.write16(addr, value);
         }
-        // Fallback to 2x write8 for MMIO
+        // For word-aligned MMIO, try atomic word write first.
+        // Splitting into 2× write8 causes side effects (serial output,
+        // SPI data-written flag, etc.) to fire twice per logical write.
+        if addr & 3 == 0 {
+            if write_special_mmio_word(
+                self.mmio,
+                self.serial_output,
+                self.mmio_writes,
+                self.register_meta,
+                self.systick,
+                addr,
+                value as u32,
+            ) {
+                if is_nvic_enable_addr(addr) {
+                    *self.nvic_any_enabled = nvic_any_enabled(self.mmio);
+                }
+                return Ok(());
+            }
+        }
+        // Fallback to 2x write8 for non-special or non-aligned MMIO
         self.write8(addr, (value & 0xFF) as u8)?;
         self.write8(addr + 1, (value >> 8) as u8)
     }

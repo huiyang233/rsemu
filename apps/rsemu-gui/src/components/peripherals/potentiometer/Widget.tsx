@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { injectAdc, pinToAdcChannel } from "../../../lib/tauri";
 import type { PotentiometerConfig } from "../../../types/peripheral";
 
@@ -14,6 +14,13 @@ export default function PotentiometerWidget({ config, interactive = true }: Prop
 
   const valid = !!config.pin;
   const isHorizontal = config.orientation !== "vertical";
+
+  // Inject default center value on mount
+  useEffect(() => {
+    if (!config.pin) return;
+    const channel = pinToAdcChannel(config.pin);
+    injectAdc(config.adc, channel, 2048);
+  }, [config.adc, config.pin]);
 
   const computeValue = useCallback(
     (clientX: number, clientY: number): number => {
